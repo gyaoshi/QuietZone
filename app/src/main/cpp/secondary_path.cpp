@@ -29,9 +29,8 @@ namespace anc {
 // SecondaryPathEstimator
 // ============================================================
 
-SecondaryPathEstimator::SecondaryPathEstimator(int filterLength, int blockSize)
+SecondaryPathEstimator::SecondaryPathEstimator(int filterLength, int /*blockSize*/)
     : filter_length_(filterLength)
-    , block_size_(blockSize)
     , path_buf_idx_(0)
     , estimate_buf_idx_(0)
     , is_estimated_(false)
