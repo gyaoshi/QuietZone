@@ -472,4 +472,32 @@ void AudioProcessor::reset() {
     prev_output_ = 0.0f;
 }
 
+void AudioProcessor::offlineCalibrate(const float* input, const float* output, int len) {
+    // 使用互相关法估计次级路径脉冲响应
+    // h[n] = Rxy[n] / Rxx[0]
+    // 其中 Rxy 是输入-输出互相关, Rxx 是输入自相关
+    int pathLen = config_.secondaryPathLength;
+    if (len < pathLen || !sec_path_) return;
+
+    std::vector<float> h(pathLen, 0.0f);
+
+    // 计算自相关 Rxx[0]
+    float rxx0 = 0.0f;
+    for (int i = 0; i < len; i++) {
+        rxx0 += input[i] * input[i];
+    }
+    if (rxx0 < 1e-12f) return;
+
+    // 计算互相关 Rxy[0..pathLen-1]
+    for (int lag = 0; lag < pathLen; lag++) {
+        float rxy = 0.0f;
+        for (int i = lag; i < len; i++) {
+            rxy += input[i - lag] * output[i];
+        }
+        h[lag] = rxy / rxx0;
+    }
+
+    sec_path_->setPathCoeffs(h.data(), pathLen);
+}
+
 } // namespace anc

@@ -12,11 +12,10 @@ import androidx.core.app.NotificationCompat
 import com.anc.app.ui.MainActivity
 
 /**
- * ANC 前台服务 v2
+ * ANC 前台服务 v3
  *
- * 变更:
- *   - 直接使用 ANCEngine (Oboe C++ 回调), 不再通过 AudioStreamManager
- *   - 音频流生命周期由 C++ OboeEngine 管理
+ * 使用 ANCEngine 单例, 不再创建独立引擎实例。
+ * 仅负责前台通知生命周期, 引擎操作由 ViewModel 通过单例控制。
  */
 class ANCService : Service() {
 
@@ -34,7 +33,7 @@ class ANCService : Service() {
         const val EXTRA_EXTERNAL_SPEAKER = "external_speaker"
     }
 
-    private val engine = ANCEngine()
+    private val engine = ANCEngine.getInstance()
     private var isRunning = false
 
     override fun onCreate() {
@@ -46,11 +45,17 @@ class ANCService : Service() {
         when (intent?.action) {
             ACTION_START -> {
                 startForeground(NOTIFICATION_ID, createNotification("启动中..."))
-                startANC(intent)
+                isRunning = true
+                startStatsUpdater()
             }
             ACTION_STOP -> {
-                stopANC()
-                stopForeground(STOP_FOREGROUND_REMOVE)
+                isRunning = false
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                } else {
+                    @Suppress("DEPRECATION")
+                    stopForeground(true)
+                }
                 stopSelf()
             }
             ACTION_UPDATE_CONFIG -> {
@@ -63,42 +68,11 @@ class ANCService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        stopANC()
+        isRunning = false
         super.onDestroy()
     }
 
-    private fun startANC(intent: Intent) {
-        if (isRunning) return
-
-        val mode = intent.getIntExtra(EXTRA_MODE, 2)
-        val stepSize = intent.getFloatExtra(EXTRA_STEP_SIZE, 0.01f)
-        val outputGain = intent.getFloatExtra(EXTRA_OUTPUT_GAIN, 1.0f)
-        val externalSpeaker = intent.getBooleanExtra(EXTRA_EXTERNAL_SPEAKER, false)
-
-        val config = ANCConfig(mode = mode, stepSize = stepSize)
-
-        if (!engine.init(config)) {
-            updateNotification("初始化失败")
-            return
-        }
-
-        engine.setOutputGain(outputGain)
-        engine.setExternalSpeaker(externalSpeaker)
-
-        // 启动校准
-        engine.calibrate()
-
-        // 启动 Oboe 音频流
-        if (!engine.start()) {
-            updateNotification("音频启动失败")
-            engine.release()
-            return
-        }
-
-        isRunning = true
-        updateNotification("Hybrid ANC 运行中")
-
-        // 启动统计更新线程
+    private fun startStatsUpdater() {
         Thread({
             while (isRunning && engine.isRunning()) {
                 val stats = engine.getStats()
@@ -110,13 +84,6 @@ class ANCService : Service() {
                 try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
             }
         }, "ANC-StatsUpdater").start()
-    }
-
-    private fun stopANC() {
-        if (!isRunning) return
-        isRunning = false
-        engine.stop()
-        engine.release()
     }
 
     private fun updateConfig(intent: Intent) {
@@ -133,7 +100,6 @@ class ANCService : Service() {
         if (intent.hasExtra(EXTRA_EXTERNAL_SPEAKER)) {
             val external = intent.getBooleanExtra(EXTRA_EXTERNAL_SPEAKER, false)
             engine.setExternalSpeaker(external)
-            // 外接音箱切换需要重新校准
             if (external) {
                 engine.calibrate()
             }

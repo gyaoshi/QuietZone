@@ -84,8 +84,5 @@ dependencies {
     // Oboe - 低延迟音频引擎
     implementation "com.google.oboe:oboe:1.8.0"
 
-    // Chart / Visualization
-    implementation "com.github.mikephil.charting:mpandroidchart:3.7.0"
-
     debugImplementation "androidx.compose.ui:ui-tooling"
 }

@@ -42,9 +42,10 @@ fun ANCScreen(
     }
 
     // 首次启动时检查权限
+    val activity = context as? android.app.Activity
     LaunchedEffect(Unit) {
-        if (!hasPermission) {
-            PermissionHelper.requestPermissions(context as android.app.Activity)
+        if (!hasPermission && activity != null) {
+            PermissionHelper.requestPermissions(activity)
         }
     }
 
@@ -173,7 +174,6 @@ private fun HeaderSection(state: ANCState) {
                     is ANCState.Converging -> "收敛中"
                     is ANCState.Running -> "运行中"
                     is ANCState.Error -> "错误"
-                    is ANCState.RequestingPermission -> "请求权限"
                 },
                 color = when (state) {
                     is ANCState.Running -> ANCColors.AccentGreen

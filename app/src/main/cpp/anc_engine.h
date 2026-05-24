@@ -248,6 +248,9 @@ public:
     void startCalibration();
     bool isCalibrating() const { return calibrating_.load(); }
 
+    // 离线校准: 使用采集的白噪声数据更新次级路径
+    void offlineCalibrate(const float* input, const float* output, int len);
+
     // 重置
     void reset();
 

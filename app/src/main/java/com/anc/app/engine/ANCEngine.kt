@@ -1,16 +1,25 @@
 package com.anc.app.engine
 
 /**
- * ANC引擎 JNI 接口 v2
+ * ANC引擎 JNI 接口 v3 (Singleton)
  *
  * 变更:
+ *   - 单例模式, ViewModel 和 Service 共享同一实例
  *   - nativeStart/Stop 替代旧 processFrame (Oboe C++ 回调内直接处理)
- *   - 新增 nativeIsRunning / nativeIsCalibrating 状态查询
  *   - 实时音频路径全程在 C++ 完成, JNI 仅用于参数/统计传递
  */
-class ANCEngine {
+class ANCEngine private constructor() {
 
     companion object {
+        @Volatile
+        private var instance: ANCEngine? = null
+
+        fun getInstance(): ANCEngine {
+            return instance ?: synchronized(this) {
+                instance ?: ANCEngine().also { instance = it }
+            }
+        }
+
         init {
             System.loadLibrary("anc_engine")
         }
@@ -44,10 +53,10 @@ class ANCEngine {
     external fun nativeIsRunning(): Boolean
     external fun nativeReset()
     external fun nativeRelease()
-    external fun nativeProcessFrame(micInput: FloatArray, speakerOutput: FloatArray, numSamples: Int)
 
     // ===== Kotlin 封装 =====
 
+    @Volatile
     private var initialized = false
 
     fun init(config: ANCConfig): Boolean {
@@ -98,6 +107,7 @@ class ANCEngine {
     fun getStats(): ANCStats? {
         if (!initialized) return null
         val data = nativeGetStats() ?: return null
+        if (data.size < 7) return null
         return ANCStats(
             noiseReductionDb = data[0],
             processingTimeUs = data[1],
