@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.ANCApp" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">@color/accent</item>
+        <item name="colorSurface">#0A0E17</item>
+        <item name="android:windowBackground">#0A0E17</item>
+        <item name="android:statusBarColor">#0A0E17</item>
+        <item name="android:navigationBarColor">#0A0E17</item>
+    </style>
+
+    <color name="accent">#00E5FF</color>
+    <color name="accent_green">#00E676</color>
+    <color name="dark_bg">#0A0E17</color>
+</resources>

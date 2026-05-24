@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ANC 主动降噪</string>
+    <string name="channel_name">ANC降噪服务</string>
+
+    <!-- 模式名称 -->
+    <string name="mode_feedforward">前馈降噪</string>
+    <string name="mode_feedback">反馈降噪</string>
+    <string name="mode_hybrid">混合降噪</string>
+
+    <!-- 状态 -->
+    <string name="status_idle">待机</string>
+    <string name="status_running">运行中</string>
+    <string name="status_calibrating">校准中</string>
+
+    <!-- 参数 -->
+    <string name="param_step_size">步长 (μ)</string>
+    <string name="param_output_gain">输出增益</string>
+    <string name="param_external_speaker">外接音箱</string>
+
+    <!-- 权限说明 -->
+    <string name="permission_rationale">主动降噪需要麦克风权限来采集环境噪声</string>
+</resources>
