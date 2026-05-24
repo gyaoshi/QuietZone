@@ -24,7 +24,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.anc.app.engine.ANCState
 import com.anc.app.engine.ANCStats
-import kotlin.math.coerceIn
 
 // ============================================================
 // 颜色常量
