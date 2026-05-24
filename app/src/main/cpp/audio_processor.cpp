@@ -403,7 +403,7 @@ void AudioProcessor::updateStats(float ref_power, float err_power) {
 void AudioProcessor::generateAuxiliaryNoise(float* buffer, int len) {
     float level = 0.01f; // -40dB
     for (int i = 0; i < len; i++) {
-        buffer[i] = level * (2.0f * (float)rand() / RAND_MAX - 1.0f);
+        buffer[i] = level * (2.0f * (rand() & 0x7FFF) / 32767.0f - 1.0f);
     }
 }
 
