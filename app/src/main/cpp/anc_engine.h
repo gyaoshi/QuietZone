@@ -174,7 +174,6 @@ public:
 
 private:
     int filter_length_;
-    int block_size_;
     std::vector<float> path_coeffs_;     // Ŝ(z)系数
     std::vector<float> path_buffer_;     // 滤波环形缓冲
     int path_buf_idx_;                   // 环形缓冲写入位置
