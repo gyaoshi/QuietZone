@@ -11,4 +11,5 @@
     <color name="accent">#00E5FF</color>
     <color name="accent_green">#00E676</color>
     <color name="dark_bg">#0A0E17</color>
+    <color name="ic_launcher_background">#0A0E17</color>
 </resources>

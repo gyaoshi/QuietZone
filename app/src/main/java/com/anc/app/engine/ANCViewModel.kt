@@ -2,6 +2,7 @@ package com.anc.app.engine
 
 import android.app.Application
 import android.content.Intent
+import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Job
@@ -16,16 +17,15 @@ import kotlinx.coroutines.launch
  * ANC 状态机 ViewModel
  *
  * 状态转换:
- *   Idle → RequestingPermission → Calibrating → Converging → Running
- *                                                              ↓
- *   Idle ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ←
+ *   Idle → Calibrating → Converging → Running
+ *                                       ↓
+ *   Idle ← ← ← ← ← ← ← ← ← ← ← ← ←
  *
  *   任何状态 → Error
  */
 
 sealed class ANCState {
     object Idle : ANCState()
-    object RequestingPermission : ANCState()
     object Calibrating : ANCState()
     data class Converging(val progress: Float) : ANCState()
     data class Running(
@@ -46,9 +46,30 @@ data class ANCUIState(
     val refSpectrum: FloatArray = FloatArray(128) { -100f },
     val errSpectrum: FloatArray = FloatArray(128) { -100f }
 ) {
-    // FloatArray 不支持结构化比较, 需要手动 override
-    override fun equals(other: Any?): Boolean = this === other
-    override fun hashCode(): Int = System.identityHashCode(this)
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is ANCUIState) return false
+        return state == other.state &&
+                selectedMode == other.selectedMode &&
+                stepSize == other.stepSize &&
+                outputGain == other.outputGain &&
+                externalSpeaker == other.externalSpeaker &&
+                stats == other.stats &&
+                refSpectrum.contentEquals(other.refSpectrum) &&
+                errSpectrum.contentEquals(other.errSpectrum)
+    }
+
+    override fun hashCode(): Int {
+        var result = state.hashCode()
+        result = 31 * result + selectedMode
+        result = 31 * result + stepSize.hashCode()
+        result = 31 * result + outputGain.hashCode()
+        result = 31 * result + externalSpeaker.hashCode()
+        result = 31 * result + stats.hashCode()
+        result = 31 * result + refSpectrum.contentHashCode()
+        result = 31 * result + errSpectrum.contentHashCode()
+        return result
+    }
 }
 
 class ANCViewModel(application: Application) : AndroidViewModel(application) {
@@ -56,14 +77,11 @@ class ANCViewModel(application: Application) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(ANCUIState())
     val uiState: StateFlow<ANCUIState> = _uiState.asStateFlow()
 
-    private val engine = ANCEngine()
+    private val engine = ANCEngine.getInstance()
     private var statsJob: Job? = null
 
     // ===== 用户操作 =====
 
-    /**
-     * 点击主控按钮
-     */
     fun toggleANC() {
         when (_uiState.value.state) {
             is ANCState.Idle -> startANC()
@@ -73,13 +91,9 @@ class ANCViewModel(application: Application) : AndroidViewModel(application) {
             is ANCState.Error -> {
                 _uiState.value = _uiState.value.copy(state = ANCState.Idle)
             }
-            else -> {}
         }
     }
 
-    /**
-     * 权限结果回调
-     */
     fun onPermissionResult(granted: Boolean) {
         if (granted) {
             startANC()
@@ -90,45 +104,30 @@ class ANCViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * 切换模式
-     */
     fun setMode(mode: Int) {
         _uiState.value = _uiState.value.copy(selectedMode = mode)
         engine.setMode(mode)
         sendConfigToService()
     }
 
-    /**
-     * 调整步长
-     */
     fun setStepSize(mu: Float) {
         _uiState.value = _uiState.value.copy(stepSize = mu)
         engine.setStepSize(mu)
         sendConfigToService()
     }
 
-    /**
-     * 调整输出增益
-     */
     fun setOutputGain(gain: Float) {
         _uiState.value = _uiState.value.copy(outputGain = gain)
         engine.setOutputGain(gain)
         sendConfigToService()
     }
 
-    /**
-     * 切换外接音箱
-     */
     fun setExternalSpeaker(external: Boolean) {
         _uiState.value = _uiState.value.copy(externalSpeaker = external)
         engine.setExternalSpeaker(external)
         sendConfigToService()
     }
 
-    /**
-     * 重新校准
-     */
     fun recalibrate() {
         engine.calibrate()
         _uiState.value = _uiState.value.copy(state = ANCState.Calibrating)
@@ -157,10 +156,6 @@ class ANCViewModel(application: Application) : AndroidViewModel(application) {
         val context = getApplication<Application>()
         val serviceIntent = Intent(context, ANCService::class.java).apply {
             action = ANCService.ACTION_START
-            putExtra(ANCService.EXTRA_MODE, config.mode)
-            putExtra(ANCService.EXTRA_STEP_SIZE, config.stepSize)
-            putExtra(ANCService.EXTRA_OUTPUT_GAIN, _uiState.value.outputGain)
-            putExtra(ANCService.EXTRA_EXTERNAL_SPEAKER, _uiState.value.externalSpeaker)
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -202,7 +197,6 @@ class ANCViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             while (isActive) {
                 if (!engine.isCalibrating()) {
-                    // 校准完成, 进入收敛阶段
                     _uiState.value = _uiState.value.copy(state = ANCState.Converging(0f))
                     break
                 }
@@ -261,13 +255,5 @@ class ANCViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         super.onCleared()
         statsJob?.cancel()
-        engine.release()
-    }
-
-    private object Build {
-        object VERSION {
-            const val SDK_INT = android.os.Build.VERSION.SDK_INT
-            const val O = android.os.Build.VERSION_CODES.O
-        }
     }
 }

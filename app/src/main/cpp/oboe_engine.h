@@ -64,9 +64,11 @@ private:
     std::atomic<bool> anc_enabled_{false};
 
     // 校准
-    int calibration_frames_remaining_ = 0;
+    std::atomic<int> calibration_frames_remaining_{0};
+    std::mutex calibration_mutex_;
     std::vector<float> calibration_input_;
     std::vector<float> calibration_output_;
+    uint32_t noise_state_ = 42;
 
     // 统计快照 (atomic)
     std::atomic<float> stat_nr_db_{0.0f};

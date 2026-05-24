@@ -18,11 +18,13 @@
 #include <vector>
 #include <cstring>
 #include <algorithm>
+#include <type_traits>
 
 namespace anc {
 
 template <typename T>
 class RingBuffer {
+    static_assert(std::is_trivially_copyable_v<T>, "RingBuffer requires trivially copyable type T");
 public:
     /**
      * @param capacity 缓冲区容量 (自动向上取整到2的幂)
@@ -153,6 +155,7 @@ private:
         n |= n >> 4;
         n |= n >> 8;
         n |= n >> 16;
+        n |= n >> 32;  // 支持 64-bit size_t
         return n + 1;
     }
 

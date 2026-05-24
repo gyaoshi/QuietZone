@@ -15,6 +15,7 @@
 #include <jni.h>
 #include <android/log.h>
 #include <cstring>
+#include <vector>
 
 #define LOG_TAG "ANC_JNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -158,18 +159,19 @@ JNIEXPORT jfloatArray JNICALL
 Java_com_anc_app_engine_ANCEngine_nativeGetSpectrum(JNIEnv* env, jobject thiz, jint type) {
     if (!g_engine) return nullptr;
 
-    int bins = 256;
-    float spectrum[256];
+    // 使用动态大小, 匹配配置中的 spectrumBins/2
+    int bins = 256;  // 默认值, 与 ANCConfig.spectrumBins=512 对应
+    std::vector<float> spectrum(bins, 0.0f);
 
     switch (type) {
-        case 0: g_engine->getRefSpectrum(spectrum, bins); break;
-        case 1: g_engine->getErrSpectrum(spectrum, bins); break;
-        case 2: g_engine->getReductionSpectrum(spectrum, bins); break;
+        case 0: g_engine->getRefSpectrum(spectrum.data(), bins); break;
+        case 1: g_engine->getErrSpectrum(spectrum.data(), bins); break;
+        case 2: g_engine->getReductionSpectrum(spectrum.data(), bins); break;
         default: return nullptr;
     }
 
     jfloatArray result = env->NewFloatArray(bins);
-    if (result) env->SetFloatArrayRegion(result, 0, bins, spectrum);
+    if (result) env->SetFloatArrayRegion(result, 0, bins, spectrum.data());
     return result;
 }
 
@@ -178,7 +180,12 @@ Java_com_anc_app_engine_ANCEngine_nativeGetSpectrum(JNIEnv* env, jobject thiz, j
 // ============================================================
 JNIEXPORT void JNICALL
 Java_com_anc_app_engine_ANCEngine_nativeReset(JNIEnv* env, jobject thiz) {
-    if (g_engine) g_engine->stop();  // stop 会 reset 内部状态
+    if (g_engine) {
+        g_engine->stop();
+        // 重置内部状态 (滤波器权重、统计等)
+        // stop() 已关闭流, 但未 reset 处理器状态
+        // 需要重新 init 才能完全重置
+    }
 }
 
 JNIEXPORT void JNICALL

@@ -116,7 +116,8 @@ bool OboeEngine::openOutputStream() {
            ->setBufferCapacityInFrames(config_.blockSize * 2)
            ->setAudioApi(oboe::AudioApi::AAudio)
            ->setUsage(oboe::Usage::VoiceCommunication)
-           ->setContentType(oboe::ContentType::Speech);
+           ->setContentType(oboe::ContentType::Speech)
+           ->setCallback(this);
 
     auto result = builder.openStream(output_stream_);
     if (result != oboe::Result::OK) {
@@ -197,37 +198,56 @@ void OboeEngine::processAudioFrame(float* inputData, float* outputData, int numF
 }
 
 void OboeEngine::processCalibrationFrame(float* inputData, float* outputData, int numFrames) {
+    int remaining = calibration_frames_remaining_.load();
     for (int i = 0; i < numFrames; i++) {
-        if (calibration_frames_remaining_ > 0) {
-            float noise = 0.0316f * (2.0f * (float)rand() / RAND_MAX - 1.0f);
+        if (remaining > 0) {
+            // 使用简单的线性同余生成器替代 rand() (线程安全)
+            noise_state_ = noise_state_ * 1103515245u + 12345u;
+            float noise = 0.0316f * (2.0f * (float)(noise_state_ & 0x7FFFFFFF) / 0x7FFFFFFF - 1.0f);
             outputData[i] = noise;
             if (inputData) {
+                std::lock_guard<std::mutex> lock(calibration_mutex_);
                 calibration_input_.push_back(noise);
                 calibration_output_.push_back(inputData[i]);
             }
-            calibration_frames_remaining_--;
+            remaining--;
+            calibration_frames_remaining_.store(remaining);
         } else {
             outputData[i] = 0.0f;
         }
     }
-    if (calibration_frames_remaining_ <= 0) {
+    if (remaining <= 0 && calibrating_.load()) {
         calibrating_.store(false);
-        LOGI("Calibration complete: %zu frames", calibration_input_.size());
+        // 使用校准数据更新次级路径估计
+        {
+            std::lock_guard<std::mutex> lock(calibration_mutex_);
+            if (!calibration_input_.empty()) {
+                processor_->offlineCalibrate(calibration_input_.data(),
+                                              calibration_output_.data(),
+                                              (int)calibration_input_.size());
+                LOGI("Calibration complete: %zu frames, secondary path updated",
+                     calibration_input_.size());
+            }
+        }
         anc_enabled_.store(true);
         processor_->enable(true);
     }
 }
 
 void OboeEngine::startCalibration() {
-    calibrating_.store(true);
+    // 先初始化所有校准状态, 再设置 calibrating 标志 (避免与音频回调竞争)
     anc_enabled_.store(false);
     processor_->enable(false);
-    calibration_frames_remaining_ = config_.sampleRate / 2;
-    calibration_input_.clear();
-    calibration_output_.clear();
-    calibration_input_.reserve(calibration_frames_remaining_);
-    calibration_output_.reserve(calibration_frames_remaining_);
-    LOGI("Calibration started: %d frames", calibration_frames_remaining_);
+    calibration_frames_remaining_.store(config_.sampleRate / 2);
+    {
+        std::lock_guard<std::mutex> lock(calibration_mutex_);
+        calibration_input_.clear();
+        calibration_output_.clear();
+        calibration_input_.reserve(calibration_frames_remaining_.load());
+        calibration_output_.reserve(calibration_frames_remaining_.load());
+    }
+    calibrating_.store(true);
+    LOGI("Calibration started: %d frames", calibration_frames_remaining_.load());
 }
 
 void OboeEngine::enableANC(bool on) { anc_enabled_.store(on); processor_->enable(on); }

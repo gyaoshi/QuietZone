@@ -21,7 +21,7 @@ object PermissionHelper {
         }
     }
 
-    const val REQUEST_CODE = 1001
+    const val REQUEST_CODE = 2001
 
     /** 检查是否已获得所有必要权限 */
     fun hasAllPermissions(context: Context): Boolean {
