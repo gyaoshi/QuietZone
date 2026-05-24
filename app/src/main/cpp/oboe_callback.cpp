@@ -203,7 +203,7 @@ void OboeEngine::processCalibrationFrame(float* inputData, float* outputData, in
         if (remaining > 0) {
             // 使用简单的线性同余生成器替代 rand() (线程安全)
             noise_state_ = noise_state_ * 1103515245u + 12345u;
-            float noise = 0.0316f * (2.0f * (float)(noise_state_ & 0x7FFFFFFF) / 0x7FFFFFFF - 1.0f);
+            float noise = 0.0316f * (2.0f * static_cast<float>(noise_state_ & 0xFFFF) / 65535.0f - 1.0f);
             outputData[i] = noise;
             if (inputData) {
                 std::lock_guard<std::mutex> lock(calibration_mutex_);
