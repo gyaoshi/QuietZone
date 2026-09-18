@@ -97,11 +97,13 @@ bool AudioProcessor::init(const ANCConfig& config) {
 }
 
 void AudioProcessor::updateTonalStep() {
-    // 仿真标定的经验边界: 归一化步长的失稳临界值约 7e-3 (D 在 1~20ms 之间变化不大)，
-    // 且长时间延迟时还要更保守。取 2/D 并夹在 [3e-4, 3e-3]，留有 ~2.5 倍裕度。
+    // 仿真标定 (sim/results_step_rule_by_delay.txt): 各延迟下实测最大安全步长为
+    //   D=96→0.005, D=144→0.005, D=288→0.007, D=480→0.004, D=720→更小
+    // 取 1/D 并夹在 [2e-4, 2e-3] 后, 在 D<=500 时恒为 0.002，实测裕度 2.0~3.5x；
+    // D 很大时按 1/D 继续收紧。切勿用 2/D (~3e-3)：D=480 时裕度仅剩 1.3x, 会发散。
     // 另有运行时失稳回退保护 (见 runToneDetection)，可再降一半。
     const float D = static_cast<float>(std::max(48, sec_path_.delaySamples()));
-    config_.tonalStep = std::clamp(2.0f / D, 3e-4f, 3e-3f);
+    config_.tonalStep = std::clamp(1.0f / D, 2e-4f, 2e-3f);
     harmonic_.setStep(config_.tonalStep);
 }
 
