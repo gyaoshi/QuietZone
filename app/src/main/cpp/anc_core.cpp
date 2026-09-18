@@ -139,8 +139,10 @@ void SecondaryPath::setImpulseResponse(const float* h, int len, float sampleRate
 
     // 有效支路: 从峰值前 4 个样本开始
     const int start = std::max(0, peak - 4);
-    // 尾部截止: 连续 32 个样本低于峰值 1% 就截断
-    const float thr = peakAbs * 0.01f;
+    // 尾部截止: 连续 32 个样本低于阈值就截断。
+    // 阈值取峰值的 0.2%。若取 1%, 会丢掉约 1% 的 L1 能量, 使次级路径的复频响
+    // 失真近 1%(相位也随之偏移), 直接影响 FxLMS 滤波参考的准确性。
+    const float thr = peakAbs * 0.002f;
     int run = 0;
     int end = len;
     for (int i = peak; i < len; i++) {
@@ -150,6 +152,10 @@ void SecondaryPath::setImpulseResponse(const float* h, int len, float sampleRate
             run = 0;
         }
     }
+    // 抽头上限: 真实测量带噪时"连续 32 个低于阈值"可能一直不成立,
+    // 加上限可同时封住运算量与延迟线长度。
+    const int kMaxTaps = 512;
+    if (end - start > kMaxTaps) end = start + kMaxTaps;
     if (end - start < 16) end = std::min(len, start + 64);
 
     active_delay_ = start;

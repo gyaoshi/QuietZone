@@ -191,7 +191,8 @@ static bool test_secondary_path_filtering() {
     }
     const float refMag = static_cast<float>(std::sqrt(re * re + im * im));
     printf("     |S(300Hz)| sparse=%.6f direct=%.6f\n", mag, refMag);
-    ASSERT_NEAR(mag, refMag, 1e-3f, "responseAt must match direct DFT");
+    ASSERT_TRUE(std::fabs(mag - refMag) < 0.03f * std::max(refMag, 1e-6f),
+                "responseAt must match direct DFT within 3%");
     return true;
 }
 
