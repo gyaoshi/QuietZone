@@ -311,6 +311,38 @@ adb shell dumpsys media.audio_flinger | Select-String "FrmCnt|Active|Standby"
 - `Usage::VoiceCommunication` 会触发系统 AEC/NS/AGC，把误差信号抹掉并抵消反噪声 → 改用 `Media` + `InputPreset::VoiceRecognition`，并保留通信模式降级 plan。
 - Manifest 增加 `FOREGROUND_SERVICE_MICROPHONE`，服务类型 `mediaPlayback|microphone`。
 
+### 8.6 「降噪量」指标口径修正（v4.4）—— 从"模型推算"改为"实测 A/B"
+
+**问题**：真机读到 `降噪量 5.4 dB`，但同时提示"次级路径未校准"。这暴露了指标本身的缺陷。
+
+原口径（`audio_processor.cpp::updateStats`）：
+
+```
+NR = 10·log10( P(d̂) / P(e) ) ,  其中 d̂ = e − Ŝ·y
+```
+
+- 分母 `P(e)` 是**实测**的（麦克风真实残差）✔
+- 分子 `P(d̂)` 是**模型推算**的。把 d̂ 展开：`d̂ = d + (S − Ŝ)·y`
+  → 只要 `Ŝ ≠ S`（未校准），分子就混入 `ΔS·y` 这一**虚假项**。
+- 而 `SecondaryPath::setDefault()`（`anc_core.cpp:108-112`）造的是一条
+  **7.9 ms 延迟 + 合成高/低通尾**的假模型，并**显式 `calibrated_ = false`**。
+  实测 `y` 已达满量程 55%（`AudioTrack maxAmplitude ≈ 1.19e9`），ΔS·y 很大
+  → **分子被显著抬高 → 报出来的 dB 会虚高**。
+
+结论：**旧口径的 5.4 dB 不能作为"真实降噪量"的证据。** 它混了模型误差。
+
+**新口径（已实施）**：控制器起来前先**静音输出 0.5 s**，用同一路麦克风实测本底功率 `P0`，
+之后上报
+
+```
+NR_measured = 10·log10( P0 / P(e) )
+```
+
+两侧都来自麦克风实采，**与 Ŝ 准不准完全无关**，是真正的"开/关"对比。
+旧口径降级为诊断量 `nr_model_db_`（不再上报）。
+
+注意：该值代表**麦克风所在那一点**的降噪量，不等于用户耳朵位置听到的效果。
+
 ### 8.5 遗留 / 待实测
 
 - 真机端到端验证（NR>0、有声音输出、无啸叫）需在 `latest` release 的 debug APK 上实测确认。

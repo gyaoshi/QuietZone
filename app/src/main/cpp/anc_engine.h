@@ -338,7 +338,10 @@ public:
     /** 处理一帧音频 (由 Oboe 回调调用, 实时路径, 无内存分配) */
     void processFrame(const float* mic_input, float* speaker_output, int numSamples);
 
-    void enable(bool on) { enabled_.store(on, std::memory_order_release); }
+    void enable(bool on) {
+        enabled_.store(on, std::memory_order_release);
+        if (on) startBaseline();   // 每次开启都重新测本底, 保证降噪量是实测差值
+    }
     bool isEnabled() const { return enabled_.load(std::memory_order_acquire); }
 
     // 运行时控制
@@ -385,6 +388,8 @@ private:
     void pushHistory(const float* mic, int n);
     /** 依据实测回环延迟重算谐波分支的保守步长 */
     void updateTonalStep();
+    /** 重启实测基线采集 (输出静音, 只测麦克风本底) */
+    void startBaseline();
 
     ANCConfig config_;
     std::atomic<bool> enabled_{false};
@@ -426,6 +431,17 @@ private:
     float o_pow_ = 0.0f;
     float xh_pow_ = 1e-6f;
     float out_pow_slow_ = 0.0f;
+
+    // ---- 实测基线法降噪指标 ----
+    // 与旧的 10log10(P(d̂)/P(e)) 不同: d̂ 是模型推算量, 这里两侧都是实测量。
+    // 控制器起来前先静音输出 0.5s 测得本底 P0, 之后 NR = 10log10(P0 / P(e)),
+    // 与次级路径准不准无关, 是真正的"开/关"对比。
+    bool nr_base_active_ = false;   // 正在采集基线 (输出静音)
+    bool nr_base_ready_ = false;    // 基线已就绪
+    long long nr_base_count_ = 0;   // 基线已采集样本数
+    double nr_base_acc_ = 0.0;      // 基线 Σe²
+    float nr_base_pow_ = 0.0f;      // 基线均方 P0
+    float nr_model_db_ = 0.0f;      // 旧的模型推算值 (仅诊断用)
     int stats_counter_ = 0;
     int detect_counter_ = 0;
     int guard_reductions_ = 0;    // 运行时降步长次数

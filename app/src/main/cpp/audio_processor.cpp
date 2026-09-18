@@ -92,8 +92,19 @@ bool AudioProcessor::init(const ANCConfig& config) {
     guard_counter_ = 0;
     guard_baseline_ = 0.0f;
 
+    startBaseline();   // 每次初始化都重测本底
     updateTonalStep();
     return true;
+}
+
+void AudioProcessor::startBaseline() {
+    // 控制器起来前先静音输出 0.5s, 用麦克风实测本底功率 P0。
+    // 之后 NR = 10log10(P0 / P(e)), 两侧都是实测量, 不依赖次级路径模型。
+    nr_base_active_ = true;
+    nr_base_ready_ = false;
+    nr_base_count_ = 0;
+    nr_base_acc_ = 0.0;
+    nr_base_pow_ = 0.0f;
 }
 
 void AudioProcessor::updateTonalStep() {
@@ -176,6 +187,30 @@ int AudioProcessor::estimateImpulseResponse(const float* recorded, const float* 
 void AudioProcessor::processFrame(const float* mic_input, float* speaker_output, int numSamples) {
     if (!enabled_.load(std::memory_order_acquire)) {
         std::memset(speaker_output, 0, numSamples * sizeof(float));
+        return;
+    }
+
+    // ---- 实测基线: 最初 0.5s 输出静音, 只采麦克风本底功率 P0 ----
+    // 注意这里刻意不跑控制器: 只有"没有反噪声"时的麦克风读数, 才能当分母基准。
+    if (nr_base_active_) {
+        double acc = 0.0;
+        for (int i = 0; i < numSamples; i++) {
+            acc += static_cast<double>(mic_input[i]) * mic_input[i];
+        }
+        nr_base_acc_ += acc;
+        nr_base_count_ += numSamples;
+        std::memset(speaker_output, 0, numSamples * sizeof(float));
+        pushHistory(mic_input, numSamples);
+        const float p_est = static_cast<float>(nr_base_acc_ /
+                            static_cast<double>(nr_base_count_));
+        stats_.referencePower = p_est;
+        stats_.errorPower = p_est;
+        stats_.noiseReductionDb = 0.0f;   // 基线阶段无所谓"降了多少"
+        if (nr_base_count_ >= config_.sampleRate / 2) {   // 0.5 s
+            nr_base_pow_ = p_est;
+            nr_base_active_ = false;
+            nr_base_ready_ = true;
+        }
         return;
     }
 
@@ -419,8 +454,17 @@ void AudioProcessor::updateStats(float dhatPower, float errPower, float outPower
         stats_.referencePower = d_pow_;
         stats_.errorPower = e_pow_;
         stats_.outputPower = o_pow_;
+        // 旧口径: 10log10(P(d̂)/P(e))。d̂ = e − Ŝ·y 是模型推算量,
+        // 次级路径不准时分子会被 ΔS·y 抬高, 报出来的降噪量会虚高 → 只留作诊断。
         if (d_pow_ > 1e-12f && e_pow_ > 1e-12f) {
-            stats_.noiseReductionDb = 10.0f * std::log10(d_pow_ / e_pow_);
+            nr_model_db_ = 10.0f * std::log10(d_pow_ / e_pow_);
+        } else {
+            nr_model_db_ = 0.0f;
+        }
+        // 新口径 (上报): 实测基线 P0 与实测残差 P(e) 之比。
+        // 两侧都来自同一路麦克风实采, 与 Ŝ 准不准无关, 是真正的开/关对比。
+        if (nr_base_ready_ && nr_base_pow_ > 1e-12f && e_pow_ > 1e-12f) {
+            stats_.noiseReductionDb = 10.0f * std::log10(nr_base_pow_ / e_pow_);
         } else {
             stats_.noiseReductionDb = 0.0f;
         }
@@ -492,6 +536,7 @@ void AudioProcessor::reset() {
     detect_elapsed_ms_ = 0;
     guard_reductions_ = 0;
     tonal_disabled_ = false;
+    startBaseline();   // 重启控制器 = 重新做一次开/关对比
     // 步长回到与回环延迟匹配的保守初值
     updateTonalStep();
 }

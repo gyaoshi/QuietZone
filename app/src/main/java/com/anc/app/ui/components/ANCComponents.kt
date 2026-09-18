@@ -144,7 +144,9 @@ fun StatsPanel(stats: ANCStats) {
                 horizontalArrangement = Arrangement.SpaceEvenly
             ) {
                 StatItem(
-                    label = "降噪量",
+                    // "实测": 由麦克风本底 P0 与当前残差 P(e) 实测对比得到,
+                    // 不再用次级路径模型推算, 所以这个数可以直接信。
+                    label = "降噪量(实测)",
                     value = String.format("%.1f dB", stats.noiseReductionDb),
                     color = when {
                         stats.noiseReductionDb > 10 -> ANCColors.AccentGreen
