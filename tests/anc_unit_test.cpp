@@ -154,16 +154,32 @@ static bool test_secondary_path_filtering() {
     std::vector<float> got(static_cast<size_t>(N), 0.0f);
     for (int i = 0; i < N; i++) got[static_cast<size_t>(i)] = sp.filter(line, x[static_cast<size_t>(i)]);
 
-    float maxErr = 0.0f;
+    // 检查 1: 与稀疏支路的显式卷积逐样本一致 (严格) —— 抓索引/回绕 bug
+    const int st = sp.delaySamples();
+    const int nt = sp.tapCount();
+    const float* c = sp.taps();
+    float maxErrSparse = 0.0f;
+    for (int n = st + nt; n < N; n++) {
+        double ref = 0.0;
+        for (int k = 0; k < nt; k++) ref += c[k] * x[static_cast<size_t>(n - st - k)];
+        maxErrSparse = std::max(maxErrSparse,
+                                std::fabs(static_cast<float>(ref) - got[static_cast<size_t>(n)]));
+    }
+    printf("     max |S*x - sparse*x| = %.3e  (start=%d taps=%d)\n", maxErrSparse, st, nt);
+    ASSERT_TRUE(maxErrSparse < 1e-5f, "sparse FIR must match its own explicit convolution");
+
+    // 检查 2: 稀疏模型对真实冲激响应的逼近 (尾部按峰值 1% 截断, 误差有界即可)
+    float maxErrFull = 0.0f;
     for (int n = D + 8; n < N; n++) {
         double ref = 0.0;
         for (int k = 0; k < static_cast<int>(h.size()); k++) {
             if (n - k >= 0) ref += h[static_cast<size_t>(k)] * x[static_cast<size_t>(n - k)];
         }
-        maxErr = std::max(maxErr, std::fabs(static_cast<float>(ref) - got[static_cast<size_t>(n)]));
+        maxErrFull = std::max(maxErrFull,
+                              std::fabs(static_cast<float>(ref) - got[static_cast<size_t>(n)]));
     }
-    printf("     max |Ŝ*x - h*x| = %.3e\n", maxErr);
-    ASSERT_TRUE(maxErr < 1e-4f, "sparse FIR must equal direct convolution");
+    printf("     max |S*x - h*x|      = %.3e (截断误差)\n", maxErrFull);
+    ASSERT_TRUE(maxErrFull < 2e-2f, "sparse model must closely approximate the true path");
 
     // 复频响与直接 DFT 对比
     float mag = 0.0f, ph = 0.0f;
@@ -197,20 +213,18 @@ static bool test_adaptive_filter_system_id() {
         return (static_cast<float>((seed >> 8) & 0xFFFF) / 32768.0f) - 1.0f;
     };
 
-    SecPathLine dummy;   // 这里直接用 x 作为滤波参考 (S = 1)
     for (int n = 0; n < 40000; n++) {
         const float x = rnd();
         xhist.push_back(x);
         const float y = af.process(x);
-        af.pushFilteredRef(x);       // Ŝ = 1
+        af.pushFilteredRef(x);       // 此处 S = 1
         float d = 0.0f;
         for (int k = 0; k < 3; k++) {
             if (n - k >= 0) d += target[k] * xhist[static_cast<size_t>(n - k)];
         }
-        const float e = d - y * 0.0f;   // 这里只做辨识: 误差 = 目标输出 - 滤波器输出
-        (void)e;
-        // 系统辨识: 误差 = target*x - w*x
-        af.update(d - y, 0.02f / 0.35f);
+        // AdaptiveFilter::update 采用 FxLMS 约定 w -= mu*e*x_hat, e 是要被清零的残差。
+        // 系统辨识要求 y -> d, 所以传入的残差是 (y - d)。
+        af.update(y - d, 0.02f / 0.35f);
     }
 
     const float* w = af.weights();

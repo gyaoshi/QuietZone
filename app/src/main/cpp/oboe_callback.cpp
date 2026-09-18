@@ -68,9 +68,11 @@ bool OboeEngine::init(const ANCConfig& config) {
     mic_block_.assign(static_cast<size_t>(max_block_), 0.0f);
     warp_block_.assign(static_cast<size_t>(max_block_), 0.0f);
 
-    // 水位: 目标 2 个块，高水位 4 个块
-    target_fill_ = config.blockSize * 2;
-    high_water_ = config.blockSize * 4;
+    // 弹性缓冲水位 (样本数)。
+    // 目标水位本身就是回环延迟的一部分, 所以尽量取小: 1 个块 (128 样本 = 2.7ms @48k)。
+    // 上限 3 个块, 超过就做时间弯曲压缩, 既不欠采样也不堆积。
+    target_fill_ = config.blockSize;
+    high_water_ = config.blockSize * 3;
     low_water_ = config.blockSize / 2;
 
     // 校准缓冲预分配 (探测信号最大 2 秒)
@@ -112,8 +114,21 @@ bool OboeEngine::start() {
         return false;
     }
 
-    // 预热: 输入流先跑一会儿，把环形缓冲垫到目标水位
-    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    // 预热: 让输入流先跑一小段, 把环形缓冲垫到目标水位。
+    // 只睡很短时间, 然后主动丢掉多余数据 —— 环形缓冲只有 8 个块,
+    // 睡太久会把它填满, 此后 write() 会丢弃"最新"数据(留下陈旧数据),
+    // 反而让回环延迟虚高, 直接削弱降噪效果。
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    {
+        float dummy = 0.0f;
+        int guard = 0;
+        while (mic_buffer_->availableRead() > static_cast<size_t>(target_fill_) &&
+               guard++ < 8192) {
+            if (!mic_buffer_->readOne(dummy)) break;
+        }
+        LOGI("Input pre-warm: ring level = %d samples (target %d)",
+             static_cast<int>(mic_buffer_->availableRead()), target_fill_);
+    }
 
     result = output_stream_->requestStart();
     if (result != oboe::Result::OK) {
@@ -268,42 +283,52 @@ void OboeEngine::closeStreams() {
 
 // ============================================================
 // 弹性缓冲: 取一个块的麦克风数据, 必要时做 1 样本时间弯曲纠偏
+//
+// 纠偏方向 (v4.1 修正): 水位高低与"该多取还是少取"必须对应上。
+//   水位偏高 → 多消耗 1 个样本, 再把 (n+1) 个样本压缩成 n 个  ⇒ slip=+1
+//   水位偏低 → 少消耗 1 个样本, 再把 (n-1) 个样本拉伸成 n 个  ⇒ slip=-1
+//   v4.0 把两者写反了: 水位低时反而多取, 会一路把缓冲抽干。
+// 时间弯曲是线性的, 不产生阶跃, 因此不会给自适应滤波器注入伪冲激。
 // ============================================================
 void OboeEngine::fillMicBlock(int numFrames) {
     if (numFrames > max_block_) numFrames = max_block_;
 
     const int avail = static_cast<int>(mic_buffer_->availableRead());
     int slip = 0;
-    if (avail < target_fill_) {                 // 水位偏低 → 拉伸
-        slip = +1;
-    } else if (avail - numFrames > high_water_) {  // 水位偏高 → 压缩
-        slip = -1;
+    if (avail - numFrames > high_water_) {
+        slip = +1;                              // 水位偏高 → 多消耗
+    } else if (avail < target_fill_) {
+        slip = -1;                              // 水位偏低 → 少消耗
     }
 
-    const int want = std::min(max_block_, numFrames + std::max(0, slip));
-    int got = static_cast<int>(mic_buffer_->read(mic_block_.data(), static_cast<size_t>(want)));
+    int want = numFrames + slip;
+    want = std::max(1, std::min(want, max_block_));
 
-    // 供不上就重复最后一个样本 (保持扰动估计连续, 好过补零)
-    const float last = (got > 0) ? mic_block_[got - 1] : last_mic_sample_;
-    for (int i = got; i < numFrames; i++) mic_block_[i] = last;
-    if (got > 0) last_mic_sample_ = mic_block_[got - 1];
+    const int got = static_cast<int>(
+        mic_buffer_->read(mic_block_.data(), static_cast<size_t>(want)));
 
-    if (slip != 0 && got >= numFrames + std::max(0, slip)) {
-        // 线性时间弯曲 (numFrames + slip) → numFrames，不产生阶跃
-        const float step = static_cast<float>(numFrames + slip) / static_cast<float>(numFrames);
-        const int srcLen = numFrames + slip;
+    int valid = got;
+    if (slip != 0 && got == numFrames + slip && got >= 2) {
+        // 线性时间弯曲: got 个样本 → numFrames 个样本
+        const float step = static_cast<float>(got) / static_cast<float>(numFrames);
         for (int i = 0; i < numFrames; i++) {
-            float p = static_cast<float>(i) * step;
+            const float p = static_cast<float>(i) * step;
             int i0 = static_cast<int>(p);
-            if (i0 >= srcLen - 1) i0 = srcLen - 2;
+            if (i0 >= got - 1) i0 = got - 2;
             if (i0 < 0) i0 = 0;
             const float f = p - static_cast<float>(i0);
             warp_block_[i] = mic_block_[i0] * (1.0f - f) + mic_block_[i0 + 1] * f;
         }
         std::memcpy(mic_block_.data(), warp_block_.data(),
                     static_cast<size_t>(numFrames) * sizeof(float));
+        valid = numFrames;
         drift_events_.fetch_add(1, std::memory_order_relaxed);
     }
+
+    // 供不上就重复最后一个样本 (保持扰动估计连续, 好过补零)
+    const float last = (valid > 0) ? mic_block_[valid - 1] : last_mic_sample_;
+    for (int i = valid; i < numFrames; i++) mic_block_[i] = last;
+    if (valid > 0) last_mic_sample_ = mic_block_[valid - 1];
 }
 
 // ============================================================
@@ -431,13 +456,29 @@ void OboeEngine::startCalibration() {
         calibration_input_.data(), probe_.data(), probeLen,
         config_.secondaryPathLength, ir.data());
 
-    if (taps > 0) {
+    // 有效性检查: 峰值太弱说明探测信号根本没被录到 (静音/权限/路由问题);
+    // 此时绝不能把"垃圾冲激响应"喂给控制器 —— 错误的次级路径相位会把
+    // 窄带分支的更新方向带偏。这种情况下保留原模型, 只报告未校准。
+    float peak = 0.0f;
+    int peakAt = 0;
+    for (int i = 0; i < taps; i++) {
+        const float a = std::fabs(ir[static_cast<size_t>(i)]);
+        if (a > peak) { peak = a; peakAt = i; }
+    }
+    LOGI("Calibration IR: taps=%d peak=%.5f at %d (%.1f ms)",
+         taps, peak, peakAt, 1000.0f * peakAt / static_cast<float>(sr));
+
+    const bool peakOk = (peak > 2e-4f);
+    const bool delayOk = (peakAt > 8) && (peakAt < config_.secondaryPathLength * 9 / 10);
+    if (taps > 0 && peakOk && delayOk) {
         processor_->setSecondaryPathIr(ir.data(), taps);
         const ANCStats st = processor_->getStats();
-        LOGI("Calibration done: taps=%d loopDelay=%.2f ms",
-             taps, st.loopDelayMs);
+        LOGI("Calibration done: loopDelay=%.2f ms calibrated=%d",
+             st.loopDelayMs, st.isCalibrated ? 1 : 0);
+    } else if (!peakOk) {
+        LOGE("Calibration rejected: peak=%.5f too weak", peak);
     } else {
-        LOGE("Calibration failed: no impulse response");
+        LOGE("Calibration rejected: peakAt=%d outside plausible range", peakAt);
     }
 
     processor_->enable(wasEnabled);

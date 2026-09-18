@@ -17,6 +17,12 @@
 #include "anc_engine.h"
 #include "spectrum_analyzer.h"
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#define ANC_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "ANCProc", __VA_ARGS__)
+#else
+#define ANC_LOGI(...) do { } while (0)
+#endif
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -113,6 +119,8 @@ void AudioProcessor::setSecondaryPathIr(const float* h, int len) {
     updateTonalStep();
     stats_.loopDelayMs = sec_path_.delayMs();
     stats_.isCalibrated = sec_path_.isCalibrated();
+    guard_reductions_ = 0;
+    tonal_disabled_ = false;
     enabled_.store(wasEnabled, std::memory_order_release);
 }
 
@@ -255,7 +263,10 @@ void AudioProcessor::processWideband(const float* mic, float* out, int n) {
             wide_filter_.pushFilteredRef(xh);
             xh_pow_ = 0.9995f * xh_pow_ + 0.0005f * (xh * xh);
 
-            const float mu = std::min(1.0f, config_.stepSize / (xh_pow_ + 1e-9f));
+            // 归一化 FxLMS: xh_pow_ 是参考的"均方", 分母必须是 Σx̂² (即 均方 × 长度 L)。
+            // 少乘 L 会让等效步长放大 L 倍 (L=256, 0.08 → ~20 ≫ 2), 一定发散。
+            const float mu = std::min(0.1f, config_.stepSize /
+                                      (static_cast<float>(wide_filter_.length()) * xh_pow_ + 1e-9f));
             wide_filter_.update(e_bp, mu);
         }
 
@@ -344,9 +355,10 @@ void AudioProcessor::runToneDetection() {
     const float prevF0 = harmonic_.f0();
 
     if (f0 > 0.0f) {
-        const bool needLock = (harmonic_.harmonicCount() == 0) ||
-                              (prevF0 <= 0.0f) ||
-                              (std::fabs(f0 - prevF0) / prevF0 > 0.10f);
+        const bool needLock = !tonal_disabled_ &&
+                              ((harmonic_.harmonicCount() == 0) ||
+                               (prevF0 <= 0.0f) ||
+                               (std::fabs(f0 - prevF0) / prevF0 > 0.10f));
         if (needLock) {
             harmonic_.lockTo(f0);
         }
@@ -369,6 +381,15 @@ void AudioProcessor::runToneDetection() {
         wide_filter_.reset();
         wide_filter_.setLeaky(0.999f);
         stats_.isConverged = false;
+        // 归一化步长理论上稳定; 若仍然发散, 几乎总是次级路径相位估计不可信
+        // (校准被拒, 或真实回环延迟超出模型窗口)。此时降步长只能减缓发散,
+        // 不能改变梯度方向, 所以降够次数后必须直接停掉窄带分支, 免得持续啸叫。
+        if (++guard_reductions_ >= 4 && !tonal_disabled_) {
+            tonal_disabled_ = true;
+            harmonic_.lockTo(0.0f);
+            ANC_LOGI("Tonal branch disabled after 4 step reductions "
+                     "(secondary-path phase unreliable?)");
+        }
     } else if (guard_counter_ >= 12 && nr > 8.0f && outRms < 0.20f) {
         guard_counter_ = 0;
         // 缓慢回到与回环延迟匹配的标称步长 (与 updateTonalStep 同一规则)
@@ -467,6 +488,8 @@ void AudioProcessor::reset() {
     prev_out_ = 0.0f;
     guard_counter_ = 0;
     detect_elapsed_ms_ = 0;
+    guard_reductions_ = 0;
+    tonal_disabled_ = false;
     // 步长回到与回环延迟匹配的保守初值
     updateTonalStep();
 }

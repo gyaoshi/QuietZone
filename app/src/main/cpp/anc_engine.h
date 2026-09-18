@@ -57,7 +57,7 @@ namespace anc {
 struct ANCConfig {
     int sampleRate = 48000;            // 采样率 (Hz)
     int filterLength = 256;            // 宽带自适应滤波器长度 L
-    int secondaryPathLength = 1024;    // 次级路径模型最大长度 (样本, 48k→21ms)
+    int secondaryPathLength = 2048;    // 次级路径模型最大长度 (样本, 48k=42.7ms)
     float stepSize = 0.08f;            // 宽带归一化步长
     float leakyFactor = 0.9995f;       // Leaky 因子
     int blockSize = 128;               // 处理块大小
@@ -428,6 +428,8 @@ private:
     float out_pow_slow_ = 0.0f;
     int stats_counter_ = 0;
     int detect_counter_ = 0;
+    int guard_reductions_ = 0;    // 运行时降步长次数
+    bool tonal_disabled_ = false; // 窄带分支因反复失稳被停用
     int guard_counter_ = 0;
     float guard_baseline_ = 0.0f;
     float prev_out_ = 0.0f;

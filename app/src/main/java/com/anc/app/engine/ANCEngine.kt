@@ -147,7 +147,7 @@ class ANCEngine private constructor() {
 data class ANCConfig(
     val sampleRate: Int = 48000,
     val filterLength: Int = 256,
-    val secondaryPathLength: Int = 1024,
+    val secondaryPathLength: Int = 2048,
     val stepSize: Float = 0.08f,
     val leakyFactor: Float = 0.9995f,
     val blockSize: Int = 128,
