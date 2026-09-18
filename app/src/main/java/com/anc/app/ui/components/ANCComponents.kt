@@ -165,6 +165,29 @@ fun StatsPanel(stats: ANCStats) {
                 )
             }
 
+            Spacer(modifier = Modifier.height(10.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly
+            ) {
+                StatItem(
+                    label = "噪声基频",
+                    value = if (stats.tonalCount > 0) String.format("%.0f Hz", stats.tonalHz) else "—",
+                    color = if (stats.tonalCount > 0) ANCColors.Accent else ANCColors.TextSecondary
+                )
+                StatItem(
+                    label = "谐波数",
+                    value = if (stats.tonalCount > 0) "${stats.tonalCount}" else "—",
+                    color = if (stats.tonalCount > 0) ANCColors.Accent else ANCColors.TextSecondary
+                )
+                StatItem(
+                    label = "回环延迟",
+                    value = String.format("%.1f ms", stats.loopDelayMs),
+                    color = if (stats.isCalibrated) ANCColors.AccentGreen else ANCColors.AccentOrange
+                )
+            }
+
             Spacer(modifier = Modifier.height(8.dp))
 
             LinearProgressIndicator(
@@ -175,6 +198,14 @@ fun StatsPanel(stats: ANCStats) {
                     .clip(RoundedCornerShape(4.dp)),
                 color = ANCColors.AccentGreen,
                 trackColor = ANCColors.CardBgLight
+            )
+
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = if (stats.isCalibrated) "次级路径已校准"
+                       else "次级路径未校准 — 宽带分支不生效",
+                fontSize = 11.sp,
+                color = if (stats.isCalibrated) ANCColors.TextSecondary else ANCColors.AccentOrange
             )
         }
     }
@@ -317,9 +348,9 @@ fun ModeSelector(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                ModeChip("前馈", "Feedforward", selectedMode == 0, enabled, { onModeChange(0) }, Modifier.weight(1f))
-                ModeChip("反馈", "Feedback", selectedMode == 1, enabled, { onModeChange(1) }, Modifier.weight(1f))
-                ModeChip("混合", "Hybrid ★", selectedMode == 2, enabled, { onModeChange(2) }, Modifier.weight(1f))
+                ModeChip("窄带", "Tonal ★", selectedMode == 0, enabled, { onModeChange(0) }, Modifier.weight(1f))
+                ModeChip("宽带", "Broadband", selectedMode == 1, enabled, { onModeChange(1) }, Modifier.weight(1f))
+                ModeChip("混合", "Hybrid", selectedMode == 2, enabled, { onModeChange(2) }, Modifier.weight(1f))
             }
         }
     }
@@ -451,16 +482,24 @@ fun AlgorithmInfoCard() {
         ) {
             Text("算法原理", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = ANCColors.TextPrimary)
             Spacer(modifier = Modifier.height(12.dp))
-            InfoRow("核心算法", "Leaky FxLMS")
-            InfoRow("滤波器", "FIR 256阶")
-            InfoRow("次级路径", "在线白噪声注入估计")
+            InfoRow("核心算法", "归一化 FxLMS")
+            InfoRow("窄带分支", "谐波抵消器 (6 阶)")
+            InfoRow("宽带分支", "IMC 反馈滤波 (256 阶)")
+            InfoRow("次级路径", "扫频探测 + 匹配滤波")
             InfoRow("加速", "ARM NEON SIMD")
             InfoRow("音频引擎", "Oboe (AAudio)")
             InfoRow("采样率", "48kHz")
-            InfoRow("目标延迟", "< 5ms (128 samples)")
-            InfoRow("降噪范围", "20Hz - 2kHz")
+            InfoRow("有效带宽", "30Hz - 600Hz")
             Spacer(modifier = Modifier.height(4.dp))
-            Text("y(n) = wᵀ·x(n),  w(n+1) = (1-μδ)w(n) + μ·x̂(n)·e(n)", fontSize = 11.sp, color = ANCColors.TextSecondary)
+            Text(
+                "y(n) = wᵀ·x̂(n),  w(n+1) = (1-μδ)w(n) + μ·x̂(n)·e(n)",
+                fontSize = 11.sp, color = ANCColors.TextSecondary
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                "单麦克风无法做宽带前馈，故窄带分支用内部合成参考（免疫回环延迟），宽带分支用 IMC 反馈。",
+                fontSize = 11.sp, color = ANCColors.TextSecondary
+            )
         }
     }
 }

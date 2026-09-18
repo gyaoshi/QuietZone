@@ -1,5 +1,17 @@
 /**
- * Oboe 低延迟音频回调引擎 — 头文件
+ * Oboe 低延迟音频回调引擎 — 头文件 (v4)
+ *
+ * v4 修复:
+ *   1. 启动竞态: running_ 必须在 requestStart() 之前置位。
+ *      旧版在 requestStart() 之后置位，输入流首个回调会看到 running_==false
+ *      而返回 Stop，整个流被永久停掉 —— 这正是真机上麦克风缓冲一直占满、
+ *      处理链空转的直接原因之一。
+ *   2. 漂移管理: 输入/输出是两条独立时钟的流，标称同速率但存在 ppm 级漂移。
+ *      旧版只有一次溢出警告，长期运行必然把缓冲填满或抽干。
+ *      新版用弹性缓冲: 目标水位 + 高低水位纠偏(带淡入淡出)，削峰填谷。
+ *   3. 实时路径零分配: 麦克风暂存缓冲预分配，不再在回调里 new vector。
+ *   4. 校准链路打通: 校准必须拿到麦克风数据，因此放在输出回调里做，
+ *      同时把采集缓冲改为预分配 + 无锁写入。
  */
 
 #ifndef OBOE_ENGINE_H
@@ -32,7 +44,9 @@ public:
     void setMode(int mode);
     void setOutputGain(float gain);
     void setExternalSpeaker(bool external);
+    void setMaxHarmonics(int n);
     void startCalibration();
+    void resetProcessing();
 
     // 获取数据 (供JNI读取)
     ANCStats getStats() const;
@@ -40,8 +54,8 @@ public:
     void getErrSpectrum(float* out, int len);
     void getReductionSpectrum(float* out, int len);
 
-    bool isRunning() const { return running_.load(); }
-    bool isCalibrating() const { return calibrating_.load(); }
+    bool isRunning() const { return running_.load(std::memory_order_acquire); }
+    bool isCalibrating() const { return calibrating_.load(std::memory_order_acquire); }
 
     // Oboe 回调
     oboe::DataCallbackResult onAudioReady(
@@ -60,36 +74,49 @@ private:
 
     ANCConfig config_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> stop_requested_{false};
     std::atomic<bool> calibrating_{false};
     std::atomic<bool> anc_enabled_{false};
 
+    // 实时路径预分配缓冲
+    std::vector<float> mic_block_;      // 输出回调内使用
+    std::vector<float> warp_block_;     // 时间弯曲临时缓冲
+    int max_block_ = 0;
+
+    // 弹性缓冲水位管理
+    int target_fill_ = 0;               // 目标水位 (样本)
+    int high_water_ = 0;                // 高水位: 超过则做时间弯曲压缩
+    int low_water_ = 0;                 // 低水位
+    float last_mic_sample_ = 0.0f;
+    std::atomic<int64_t> drift_events_{0};
+
     // 校准
-    std::atomic<int> calibration_frames_remaining_{0};
-    std::mutex calibration_mutex_;
-    std::vector<float> calibration_input_;
+    std::atomic<int> calibration_frames_total_{0};
+    std::atomic<int> calibration_frames_done_{0};
+    std::vector<float> calibration_input_;   // 预分配, 回调内只做下标写入
     std::vector<float> calibration_output_;
-    uint32_t noise_state_ = 42;
+    std::vector<float> probe_;
 
     // 统计快照 (atomic)
     std::atomic<float> stat_nr_db_{0.0f};
     std::atomic<float> stat_proc_us_{0.0f};
     std::atomic<float> stat_ref_power_{0.0f};
     std::atomic<float> stat_err_power_{0.0f};
-    std::atomic<bool> stat_converged_{false};
+    std::atomic<float> stat_out_power_{0.0f};
+    std::atomic<float> stat_loop_delay_ms_{0.0f};
+    std::atomic<float> stat_tonal_hz_{0.0f};
+    std::atomic<int> stat_tonal_count_{0};
     std::atomic<int> stat_frame_count_{0};
-
-    // 频谱快照
-    std::mutex spectrum_mutex_;
-    std::vector<float> ref_spectrum_;
-    std::vector<float> err_spectrum_;
-    int spectrum_update_counter_ = 0;
+    std::atomic<bool> stat_converged_{false};
+    std::atomic<bool> stat_calibrated_{false};
 
     // 内部方法
     bool openInputStream();
     bool openOutputStream();
     void closeStreams();
     void processAudioFrame(float* inputData, float* outputData, int numFrames);
-    void processCalibrationFrame(float* inputData, float* outputData, int numFrames);
+    void processCalibrationFrame(float* micData, float* outputData, int numFrames);
+    void fillMicBlock(int numFrames);
     void updateStatsSnapshot(const ANCStats& stats);
 };
 

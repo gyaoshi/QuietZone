@@ -1,17 +1,15 @@
 /**
- * JNI 接口 v2 — 对接 OboeEngine
+ * JNI 接口 v4 — 对接 OboeEngine
  *
- * 所有实时音频处理在 C++ OboeEngine 内完成，
- * JNI 仅用于:
+ * 实时音频处理全部在 C++ OboeEngine 内完成，JNI 只用于:
  *   1. 初始化/释放引擎
- *   2. 运行时参数传递 (步长/模式/增益)
- *   3. 读取统计/频谱数据 (100ms 刷新, 非实时路径)
- *
- * 实时路径: Oboe回调 → C++ FxLMS → Oboe输出 (零JNI开销)
+ *   2. 运行时参数传递 (模式/步长/增益/谐波数)
+ *   3. 读取统计/频谱 (非实时路径)
+ *   4. 触发次级路径校准 (阻塞, 由后台线程调用)
  */
 
 #include "anc_engine.h"
-#include "oboe_engine.h"  // OboeEngine 声明
+#include "oboe_engine.h"
 #include <jni.h>
 #include <android/log.h>
 #include <cstring>
@@ -23,28 +21,24 @@
 
 using namespace anc;
 
-// 全局引擎实例
 static OboeEngine* g_engine = nullptr;
 
 extern "C" {
 
-// ============================================================
-// 初始化
-// ============================================================
 JNIEXPORT jboolean JNICALL
 Java_com_anc_app_engine_ANCEngine_nativeInit(
         JNIEnv* env, jobject thiz,
         jint sampleRate, jint filterLength, jint secondaryPathLength,
         jfloat stepSize, jfloat leakyFactor, jint blockSize, jint mode) {
+    (void)env; (void)thiz;
 
-    LOGI("JNI: Init ANC Engine sr=%d L=%d M=%d μ=%f leaky=%f block=%d mode=%d",
+    LOGI("JNI v4: Init sr=%d L=%d M=%d mu=%f leaky=%f block=%d mode=%d",
          sampleRate, filterLength, secondaryPathLength, stepSize, leakyFactor, blockSize, mode);
 
     if (g_engine) {
         delete g_engine;
         g_engine = nullptr;
     }
-
     g_engine = new OboeEngine();
 
     ANCConfig config;
@@ -56,113 +50,119 @@ Java_com_anc_app_engine_ANCEngine_nativeInit(
     config.blockSize = blockSize;
     config.mode = mode;
 
-    bool ok = g_engine->init(config);
+    const bool ok = g_engine->init(config);
     LOGI("JNI: Engine init %s", ok ? "SUCCESS" : "FAILED");
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
-// ============================================================
-// 启动/停止音频流
-// ============================================================
 JNIEXPORT jboolean JNICALL
 Java_com_anc_app_engine_ANCEngine_nativeStart(JNIEnv* env, jobject thiz) {
+    (void)env; (void)thiz;
     if (!g_engine) return JNI_FALSE;
-    bool ok = g_engine->start();
+    const bool ok = g_engine->start();
     LOGI("JNI: Start %s", ok ? "SUCCESS" : "FAILED");
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT void JNICALL
 Java_com_anc_app_engine_ANCEngine_nativeStop(JNIEnv* env, jobject thiz) {
-    if (g_engine) {
-        g_engine->stop();
-        LOGI("JNI: Stopped");
-    }
+    (void)env; (void)thiz;
+    if (g_engine) { g_engine->stop(); LOGI("JNI: Stopped"); }
 }
 
-// ============================================================
-// 运行时控制
-// ============================================================
 JNIEXPORT void JNICALL
 Java_com_anc_app_engine_ANCEngine_nativeEnable(JNIEnv* env, jobject thiz, jboolean enable) {
-    if (g_engine) g_engine->enableANC(enable);
+    (void)env; (void)thiz;
+    if (g_engine) g_engine->enableANC(enable == JNI_TRUE);
 }
 
 JNIEXPORT void JNICALL
 Java_com_anc_app_engine_ANCEngine_nativeSetStepSize(JNIEnv* env, jobject thiz, jfloat mu) {
+    (void)env; (void)thiz;
     if (g_engine) g_engine->setStepSize(mu);
 }
 
 JNIEXPORT void JNICALL
 Java_com_anc_app_engine_ANCEngine_nativeSetMode(JNIEnv* env, jobject thiz, jint mode) {
+    (void)env; (void)thiz;
     if (g_engine) g_engine->setMode(mode);
 }
 
 JNIEXPORT void JNICALL
 Java_com_anc_app_engine_ANCEngine_nativeSetOutputGain(JNIEnv* env, jobject thiz, jfloat gain) {
+    (void)env; (void)thiz;
     if (g_engine) g_engine->setOutputGain(gain);
 }
 
 JNIEXPORT void JNICALL
 Java_com_anc_app_engine_ANCEngine_nativeSetExternalSpeaker(JNIEnv* env, jobject thiz, jboolean external) {
-    if (g_engine) g_engine->setExternalSpeaker(external);
+    (void)env; (void)thiz;
+    if (g_engine) g_engine->setExternalSpeaker(external == JNI_TRUE);
 }
 
-// ============================================================
-// 校准
-// ============================================================
 JNIEXPORT void JNICALL
+Java_com_anc_app_engine_ANCEngine_nativeSetMaxHarmonics(JNIEnv* env, jobject thiz, jint n) {
+    (void)env; (void)thiz;
+    if (g_engine) g_engine->setMaxHarmonics(n);
+}
+
+/** 校准: 阻塞直到采集+估计完成 (由后台线程调用) */
+JNIEXPORT jboolean JNICALL
 Java_com_anc_app_engine_ANCEngine_nativeCalibrate(JNIEnv* env, jobject thiz) {
-    if (g_engine) g_engine->startCalibration();
+    (void)env; (void)thiz;
+    if (!g_engine) return JNI_FALSE;
+    g_engine->startCalibration();
+    return g_engine->getStats().isCalibrated ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL
 Java_com_anc_app_engine_ANCEngine_nativeIsCalibrating(JNIEnv* env, jobject thiz) {
+    (void)env; (void)thiz;
     if (!g_engine) return JNI_FALSE;
     return g_engine->isCalibrating() ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL
 Java_com_anc_app_engine_ANCEngine_nativeIsRunning(JNIEnv* env, jobject thiz) {
+    (void)env; (void)thiz;
     if (!g_engine) return JNI_FALSE;
     return g_engine->isRunning() ? JNI_TRUE : JNI_FALSE;
 }
 
-// ============================================================
-// 统计数据
-// ============================================================
+/** 统计: [nr, procUs, refPow, errPow, outPow, filterNorm, delayMs, tonalHz, tonalCount, converged, calibrated, frames] */
 JNIEXPORT jfloatArray JNICALL
 Java_com_anc_app_engine_ANCEngine_nativeGetStats(JNIEnv* env, jobject thiz) {
+    (void)thiz;
     if (!g_engine) return nullptr;
 
-    ANCStats stats = g_engine->getStats();
-
-    float data[7] = {
-        stats.noiseReductionDb,
-        stats.processingTimeUs,
-        stats.referencePower,
-        stats.errorPower,
-        stats.filterNorm,
-        stats.isConverged ? 1.0f : 0.0f,
-        (float)stats.frameCount
+    const ANCStats s = g_engine->getStats();
+    const float data[12] = {
+        s.noiseReductionDb,
+        s.processingTimeUs,
+        s.referencePower,
+        s.errorPower,
+        s.outputPower,
+        s.filterNorm,
+        s.loopDelayMs,
+        s.tonalHz,
+        static_cast<float>(s.tonalCount),
+        s.isConverged ? 1.0f : 0.0f,
+        s.isCalibrated ? 1.0f : 0.0f,
+        static_cast<float>(s.frameCount)
     };
 
-    jfloatArray result = env->NewFloatArray(7);
-    if (result) env->SetFloatArrayRegion(result, 0, 7, data);
+    jfloatArray result = env->NewFloatArray(12);
+    if (result) env->SetFloatArrayRegion(result, 0, 12, data);
     return result;
 }
 
-// ============================================================
-// 频谱数据
-// ============================================================
 JNIEXPORT jfloatArray JNICALL
 Java_com_anc_app_engine_ANCEngine_nativeGetSpectrum(JNIEnv* env, jobject thiz, jint type) {
+    (void)thiz;
     if (!g_engine) return nullptr;
 
-    // 使用动态大小, 匹配配置中的 spectrumBins/2
-    int bins = 256;  // 默认值, 与 ANCConfig.spectrumBins=512 对应
-    std::vector<float> spectrum(bins, 0.0f);
-
+    const int bins = 256;
+    std::vector<float> spectrum(bins, -100.0f);
     switch (type) {
         case 0: g_engine->getRefSpectrum(spectrum.data(), bins); break;
         case 1: g_engine->getErrSpectrum(spectrum.data(), bins); break;
@@ -175,37 +175,20 @@ Java_com_anc_app_engine_ANCEngine_nativeGetSpectrum(JNIEnv* env, jobject thiz, j
     return result;
 }
 
-// ============================================================
-// 重置/释放
-// ============================================================
 JNIEXPORT void JNICALL
 Java_com_anc_app_engine_ANCEngine_nativeReset(JNIEnv* env, jobject thiz) {
-    if (g_engine) {
-        g_engine->stop();
-        // 重置内部状态 (滤波器权重、统计等)
-        // stop() 已关闭流, 但未 reset 处理器状态
-        // 需要重新 init 才能完全重置
-    }
+    (void)env; (void)thiz;
+    if (g_engine) g_engine->resetProcessing();
 }
 
 JNIEXPORT void JNICALL
 Java_com_anc_app_engine_ANCEngine_nativeRelease(JNIEnv* env, jobject thiz) {
+    (void)env; (void)thiz;
     if (g_engine) {
         delete g_engine;
         g_engine = nullptr;
         LOGI("JNI: Engine released");
     }
-}
-
-// ============================================================
-// 旧接口兼容 (processFrame 不再需要, Oboe回调内直接处理)
-// ============================================================
-JNIEXPORT void JNICALL
-Java_com_anc_app_engine_ANCEngine_nativeProcessFrame(
-        JNIEnv* env, jobject thiz,
-        jfloatArray micInput, jfloatArray speakerOutput, jint numSamples) {
-    // 已由 Oboe C++ 回调直接处理, 此方法不再使用
-    // 保留空实现以兼容旧 Kotlin 代码
 }
 
 } // extern "C"

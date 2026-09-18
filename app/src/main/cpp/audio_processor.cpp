@@ -1,445 +1,436 @@
 /**
- * 音频处理器 (v3 — 标量 FxLMS 修正版)
+ * 音频处理器 v4 —— 单麦克风可实现的降噪控制逻辑
  *
- * 三种ANC模式完整实现，针对手机单麦克风场景优化
+ * 与 v3 的根本区别:
+ *   v3: e = mic + (-y)           零延迟编造的误差信号；x̂ 用标量代替滤波参考向量
+ *       ⇒ 梯度期望恒为 0 ⇒ 权重永不增长 ⇒ 输出静音 ⇒ 降噪量恒为 0
+ *   v4: e = 麦克风实测值
+ *       d̂ = e - Ŝ*y              用校准得到的真实次级路径估计扰动
+ *       窄带分支用内部合成参考 + Ŝ 在谐波频率上的复增益做精确 FxLMS
+ *       ⇒ 环路增益被归一到单位增益，对回环延迟免疫(延迟=相位，相位可精确补偿)
  *
- * v3 关键修正:
- *   1. FxLMS 更新使用标量 x̂(n) = Ŝ * x(n)
- *      权重更新: w = leaky·w + μ·x̂(n)·e(n)·x_buf
- *   2. 逐样本 process+update 交错:
- *      process(x_n) → compute e_n → filterSample(x_n) → update(x_hat_n, e_n)
- *      保证 x_buffer_ 在 update 时与当前样本对齐
- *   3. 反馈 ANC 使用独立的输出次级路径滤波:
- *      Ŝ·y(n-1) 估计反噪声贡献，避免 NaN
- *   4. Hybrid ANC 解耦前馈/反馈:
- *      前馈先用麦克风输入，反馈用残差估计
- *
- * 算法对照 (旧版 bug vs 新版修正):
- *   旧: update(&filtered_ref_[i], err_buffer_[i], 1)
- *       → 只更新 weights_[0]，且 filtered_ref 是向量用法
- *   新: update(x_hat_n, e_n)
- *       → 更新全部权重，x_hat_n 是标量
- *
- * 三种模式:
- *   Feedforward: x(n)=mic, e(n)=mic+anti_noise, 适合宽带噪声
- *   Feedback:    e(n)=mic, d̂(n)=e(n)-Ŝ·y(n), 适合窄带周期噪声
- *   Hybrid:      FF+FB叠加, 宽窄带兼顾 (推荐)
+ * 主要约束 (仿真结论):
+ *   归一化步长 s 必须满足  s  ≲ 4π/D  (D = 回环延迟样本数)，
+ *   否则延迟积分器失稳。因此步长由实测回环延迟反推，并带运行时失稳回退保护。
  */
 
 #include "anc_engine.h"
-#include <cstring>
+#include "spectrum_analyzer.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-
-namespace anc {
+#include <cstring>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-// ============================================================
-// AudioProcessor
-// ============================================================
+namespace anc {
 
-AudioProcessor::AudioProcessor()
-    : enabled_(false)
-    , calibrating_(false)
-    , sec_output_idx_(0)
-    , prev_output_(0.0f)
-    , ref_power_accum_(0.0f)
-    , err_power_accum_(0.0f)
-    , stats_counter_(0)
-{
-}
+static constexpr int kToneWindow = 4096;      // 基频检测窗 (48k → 85ms, 分辨率 ~12Hz)
 
+// ============================================================
+// 构造 / 初始化
+// ============================================================
+AudioProcessor::AudioProcessor() = default;
 AudioProcessor::~AudioProcessor() = default;
 
 bool AudioProcessor::init(const ANCConfig& config) {
     config_ = config;
+    const float fs = static_cast<float>(config.sampleRate);
 
-    // 前馈滤波器
-    forward_filter_ = std::make_unique<FxLMSFilter>(
-        config.filterLength, config.stepSize, config.leakyFactor);
+    // 次级路径: 先给兜底模型，校准成功后再替换
+    sec_path_.setDefaultModel(fs, config.defaultLoopDelayMs,
+                              config.defaultSpkCutoffHz, config.defaultSpkGain);
 
-    // 反馈滤波器 (步长减半, 更保守)
-    feedback_filter_ = std::make_unique<FxLMSFilter>(
-        config.filterLength, config.stepSize * 0.5f, config.leakyFactor);
+    harmonic_.init(fs, config.maxHarmonics, config.controlLowHz,
+                   config.controlHighHz, config.tonalStep);
+    harmonic_.setSecondaryPath(&sec_path_);
 
-    // 次级路径估计器
-    sec_path_ = std::make_unique<SecondaryPathEstimator>(
-        config.secondaryPathLength, config.blockSize);
+    wide_filter_.init(config.filterLength, config.stepSize, config.leakyFactor);
 
-    // 频谱分析器
-    ref_analyzer_ = std::make_unique<SpectrumAnalyzer>(config.spectrumBins);
-    err_analyzer_ = std::make_unique<SpectrumAnalyzer>(config.spectrumBins);
+    tone_detector_.init(fs, kToneWindow, config.controlLowHz,
+                        std::min(config.controlHighHz, 900.0f),
+                        config.tonalityThresholdDb);
 
-    // 预分配所有缓冲区
-    int block = config.blockSize;
+    bp_ref_.setBand(config.controlLowHz, config.widebandHighHz, fs);
+    bp_err_.setBand(config.controlLowHz, config.widebandHighHz, fs);
 
-    ref_buffer_.resize(block, 0.0f);
-    err_buffer_.resize(block, 0.0f);
-    output_buffer_.resize(block, 0.0f);
-    auxiliary_noise_.resize(block, 0.0f);
+    const int block = config.blockSize;
+    // 延迟线按次级路径长度分配 (校准后可能变化, setSecondaryPathIr 会重建)
+    line_out_.resize(std::max(64, sec_path_.ringSize()));
+    line_ref_.resize(std::max(64, sec_path_.ringSize()));
 
-    // 输出次级路径滤波缓冲 (与 sec_path_ 独立)
-    sec_output_buf_.resize(config.secondaryPathLength, 0.0f);
-    sec_output_idx_ = 0;
+    dhat_block_.assign(block, 0.0f);
+    err_block_.assign(block, 0.0f);
+    out_block_.assign(block, 0.0f);
 
-    // 反馈分支独立次级路径缓冲 (用于 Hybrid: x̂_fb = Ŝ·d̂(n))
-    sec_fb_buf_.resize(config.secondaryPathLength, 0.0f);
-    sec_fb_buf_idx_ = 0;
+    const int specBins = std::max(256, config.spectrumBins);
+    dhat_hist_.assign(specBins, 0.0f);
+    err_hist_.assign(specBins, 0.0f);
+    ref_spectrum_.assign(specBins / 2, -100.0f);
+    err_spectrum_.assign(specBins / 2, -100.0f);
+    spec_ = std::make_unique<SpectrumAnalyzer>(specBins);
 
-    prev_output_ = 0.0f;
-
+    hist_pos_ = 0;
+    prev_out_ = 0.0f;
+    d_pow_ = 0.0f;
+    e_pow_ = 0.0f;
+    o_pow_ = 0.0f;
+    xh_pow_ = 1e-6f;
+    out_pow_slow_ = 0.0f;
     stats_ = ANCStats{};
-    ref_power_accum_ = 0.0f;
-    err_power_accum_ = 0.0f;
     stats_counter_ = 0;
+    detect_elapsed_ms_ = 0;
+    guard_counter_ = 0;
+    guard_baseline_ = 0.0f;
 
+    updateTonalStep();
     return true;
 }
 
+void AudioProcessor::updateTonalStep() {
+    // 仿真标定的经验边界: 归一化步长的失稳临界值约 7e-3 (D 在 1~20ms 之间变化不大)，
+    // 且长时间延迟时还要更保守。取 2/D 并夹在 [3e-4, 3e-3]，留有 ~2.5 倍裕度。
+    // 另有运行时失稳回退保护 (见 runToneDetection)，可再降一半。
+    const float D = static_cast<float>(std::max(48, sec_path_.delaySamples()));
+    config_.tonalStep = std::clamp(2.0f / D, 3e-4f, 3e-3f);
+    harmonic_.setStep(config_.tonalStep);
+}
+
+void AudioProcessor::setSecondaryPathIr(const float* h, int len) {
+    if (!h || len < 64) return;
+    const bool wasEnabled = isEnabled();
+    enabled_.store(false, std::memory_order_release);
+    sec_path_.setImpulseResponse(h, len, static_cast<float>(config_.sampleRate));
+    harmonic_.setSecondaryPath(&sec_path_);
+    line_out_.resize(std::max(64, sec_path_.ringSize()));
+    line_ref_.resize(std::max(64, sec_path_.ringSize()));
+    wide_filter_.reset();
+    harmonic_.reset();
+    prev_out_ = 0.0f;
+    updateTonalStep();
+    stats_.loopDelayMs = sec_path_.delayMs();
+    stats_.isCalibrated = sec_path_.isCalibrated();
+    enabled_.store(wasEnabled, std::memory_order_release);
+}
+
+// ============================================================
+// 校准工具 (在调用线程执行, 不占用音频线程)
+// ============================================================
+void AudioProcessor::generateProbe(float* out, int len, float fs,
+                                   float f0, float f1, float level) {
+    const double T = static_cast<double>(len) / fs;
+    for (int i = 0; i < len; i++) {
+        const double t = static_cast<double>(i) / fs;
+        // 对数扫频 (幅度包络两端做淡入淡出，避免瞬态喀哒声)
+        const double k = std::log(static_cast<double>(f1) / f0);
+        const double phase = 2.0 * M_PI * f0 * T / k * (std::exp(k * t / T) - 1.0);
+        double env = 1.0;
+        const int fade = std::min(len / 8, static_cast<int>(0.01 * fs));
+        if (fade > 1) {
+            if (i < fade) env = 0.5 - 0.5 * std::cos(M_PI * i / fade);
+            else if (i >= len - fade) env = 0.5 - 0.5 * std::cos(M_PI * (len - 1 - i) / fade);
+        }
+        out[i] = static_cast<float>(level * env * std::sin(phase));
+    }
+}
+
+int AudioProcessor::estimateImpulseResponse(const float* recorded, const float* probe,
+                                            int len, int maxTaps, float* out) {
+    if (!recorded || !probe || !out || len < maxTaps * 2) return 0;
+
+    // 探测信号能量
+    double rpp = 0.0;
+    for (int i = 0; i < len; i++) rpp += static_cast<double>(probe[i]) * probe[i];
+    if (rpp < 1e-12) return 0;
+
+    // 互相关 (匹配滤波): h[lag] = <rec(n), probe(n-lag)> / <probe, probe>
+    // 只需要 lag = 0..maxTaps-1
+    const int taps = std::min(maxTaps, len / 2);
+    const float inv = static_cast<float>(1.0 / rpp);
+    for (int lag = 0; lag < taps; lag++) {
+        double acc = 0.0;
+        for (int i = lag; i < len; i++) {
+            acc += static_cast<double>(recorded[i]) * probe[i - lag];
+        }
+        out[lag] = static_cast<float>(acc * inv);
+    }
+    return taps;
+}
+
+// ============================================================
+// 主处理入口
+// ============================================================
 void AudioProcessor::processFrame(const float* mic_input, float* speaker_output, int numSamples) {
-    if (!enabled_.load()) {
-        memset(speaker_output, 0, numSamples * sizeof(float));
+    if (!enabled_.load(std::memory_order_acquire)) {
+        std::memset(speaker_output, 0, numSamples * sizeof(float));
         return;
     }
 
-    auto t0 = std::chrono::high_resolution_clock::now();
+    const auto t0 = std::chrono::high_resolution_clock::now();
 
     switch (config_.mode) {
-        case 0:  processFeedforward(mic_input, speaker_output, numSamples); break;
-        case 1:  processFeedback(mic_input, speaker_output, numSamples);    break;
-        case 2:  processHybrid(mic_input, speaker_output, numSamples);      break;
-        default: processHybrid(mic_input, speaker_output, numSamples);      break;
+        case 0:  processNarrowband(mic_input, speaker_output, numSamples); break;
+        case 1:  processWideband(mic_input, speaker_output, numSamples);   break;
+        default: processHybrid(mic_input, speaker_output, numSamples);     break;
     }
 
-    auto t1 = std::chrono::high_resolution_clock::now();
-    float us = std::chrono::duration<float, std::micro>(t1 - t0).count();
-    stats_.processingTimeUs = 0.9f * stats_.processingTimeUs + 0.1f * us; // EMA
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    const float us = std::chrono::duration<float, std::micro>(t1 - t0).count();
+    stats_.processingTimeUs = 0.9f * stats_.processingTimeUs + 0.1f * us;
     stats_.frameCount++;
-}
 
-// ============================================================
-// 输出次级路径滤波辅助方法
-// ============================================================
-float AudioProcessor::filterOutputSecondaryPath(float y_n) {
-    /**
-     * 对输出信号做次级路径 FIR 滤波: Ŝ * y(n)
-     *
-     * 用途: 反馈 ANC 中估计原始噪声
-     *   d̂(n) = e(n) - Ŝ * y(n)
-     *
-     * 使用独立的环形缓冲，不与 sec_path_->filterSample() 冲突
-     * (sec_path_ 的 path_buffer_ 用于滤波参考信号，这里用于滤波输出信号)
-     */
-    const float* coeffs = sec_path_->getPathCoeffs();
-    int len = sec_path_->getPathLength();
-
-    sec_output_buf_[sec_output_idx_] = y_n;
-
-    float sum = 0.0f;
-    for (int i = 0; i < len; i++) {
-        int idx = (sec_output_idx_ - i + len) % len;
-        sum += coeffs[i] * sec_output_buf_[idx];
+    // 基频检测 (限频, 每 ~0.4s 一次)
+    detect_elapsed_ms_ += static_cast<long long>(numSamples) * 1000 / config_.sampleRate;
+    if (detect_elapsed_ms_ >= 400) {
+        detect_elapsed_ms_ = 0;
+        runToneDetection();
     }
+}
 
-    sec_output_idx_ = (sec_output_idx_ + 1) % len;
-    return sum;
+void AudioProcessor::pushHistory(const float* mic, int n) {
+    tone_detector_.push(mic, n);
 }
 
 // ============================================================
-// Feedforward ANC (宽带前馈)
+// 窄带谐波抵消模式
 // ============================================================
-void AudioProcessor::processFeedforward(const float* mic, float* out, int n) {
-    /**
-     * Feedforward ANC — 标量 FxLMS 正确实现
-     *
-     * 手机单麦克风场景:
-     *   - 参考信号 x(n) = 麦克风输入
-     *   - 误差信号 e(n) = x(n) + anti_noise (简化估计)
-     *   - 在真实系统中: e(n) = d(n) + S₂·y(n)，由误差麦克风测量
-     *     手机只有一个麦克风，用简化近似
-     *
-     * 逐样本处理流程:
-     *   1. y(n) = W·x(n)           [自适应滤波器输出]
-     *   2. anti_noise = -y(n)      [反噪声]
-     *   3. e(n) = x(n) + anti      [误差估计]
-     *   4. x̂(n) = Ŝ·x(n)          [标量滤波参考]
-     *   5. W ← leaky·W + μ·x̂(n)·e(n)·x_buf  [权重更新]
-     */
-
-    float ref_power = 0.0f;
-    float err_power = 0.0f;
+void AudioProcessor::processNarrowband(const float* mic, float* out, int n) {
+    float dp = 0.0f, ep = 0.0f, op = 0.0f;
+    const int specBins = static_cast<int>(dhat_hist_.size());
 
     for (int i = 0; i < n; i++) {
-        float x_n = mic[i];  // 参考信号 = 麦克风输入
+        const float e = mic[i];
 
-        // 1. 自适应滤波器输出
-        float y_n = forward_filter_->process(x_n);
+        // 扰动估计: d̂ = e - Ŝ*y(n-1)
+        const float sy = sec_path_.filter(line_out_, prev_out_);
+        float dhat = e - sy;
+        dhat = std::clamp(dhat, -2.0f, 2.0f);
 
-        // 2. 反噪声 (取反 + 增益)
-        float anti_noise = -y_n * config_.outputGain;
+        // 谐波反噪声
+        float y = harmonic_.process(e);
+        if (y > 0.95f) y = 0.95f; else if (y < -0.95f) y = -0.95f;
+        out[i] = y;
+        prev_out_ = y;
 
-        // 3. 输出限幅 (防削波, 保护扬声器)
-        anti_noise = std::clamp(anti_noise, -0.95f, 0.95f);
-        out[i] = anti_noise;
+        err_block_[i] = e;
+        dhat_block_[i] = dhat;
+        dhat_hist_[hist_pos_] = dhat;
+        err_hist_[hist_pos_] = e;
+        if (++hist_pos_ >= specBins) hist_pos_ = 0;
 
-        // 4. 误差估计:
-        //    真实: e(n) = d(n) + S₂·y(n)
-        //    近似: e(n) ≈ x(n) + anti_noise (单麦克风简化)
-        float e_n = x_n + anti_noise;
-
-        // 5. 标量滤波参考: x̂(n) = Ŝ * x(n)
-        float x_hat_n = sec_path_->filterSample(x_n);
-
-        // 6. FxLMS 权重更新 (标量 x̂(n) · 完整向量更新)
-        forward_filter_->update(x_hat_n, e_n);
-
-        // 统计与频谱
-        ref_buffer_[i] = x_n;
-        err_buffer_[i] = e_n;
-        ref_power += x_n * x_n;
-        err_power += e_n * e_n;
+        dp += dhat * dhat;
+        ep += e * e;
+        op += y * y;
+        out_pow_slow_ = 0.9995f * out_pow_slow_ + 0.0005f * (y * y);
     }
 
-    updateStats(ref_power / n, err_power / n);
-
-    if (stats_.frameCount % 8 == 0) {
-        ref_analyzer_->analyze(ref_buffer_.data(), n);
-        err_analyzer_->analyze(err_buffer_.data(), n);
-    }
+    pushHistory(mic, n);
+    updateStats(dp / n, ep / n, op / n);
 }
 
 // ============================================================
-// Feedback ANC (窄带反馈)
+// 低频宽带反馈模式 (internal model control)
 // ============================================================
-void AudioProcessor::processFeedback(const float* mic, float* out, int n) {
-    /**
-     * Feedback ANC — 标量 FxLMS 正确实现
-     *
-     * 不需要参考麦克风，从误差信号估计原始噪声:
-     *   d̂(n) = e(n) - Ŝ * y(n)
-     *
-     * 因果性处理:
-     *   - 使用前一帧输出 y(n-1) 通过次级路径估计 Ŝ·y(n-1)
-     *   - 避免循环依赖: y(n) 依赖 d̂(n)，d̂(n) 依赖 Ŝ·y(n)
-     *   - 实际系统中次级路径本身有延迟，y(n-1) 是合理近似
-     *
-     * 逐样本处理流程:
-     *   1. e(n) = mic(n)                    [误差=麦克风残差]
-     *   2. s_hat_y = Ŝ·y_prev               [次级路径输出估计]
-     *   3. d̂(n) = e(n) - s_hat_y            [原始噪声估计]
-     *   4. y(n) = W_fb·d̂(n)                 [反馈滤波器输出]
-     *   5. anti_noise = -y(n)               [反噪声]
-     *   6. x̂(n) = Ŝ·d̂(n)                   [标量滤波参考]
-     *   7. W_fb ← leaky·W_fb + μ·x̂(n)·e(n)·d̂_buf  [权重更新]
-     *
-     * 适合: 周期性噪声 (引擎、风扇、压缩机)
-     * 有效频段: 50-500Hz
-     */
-
-    float ref_power = 0.0f;
-    float err_power = 0.0f;
+void AudioProcessor::processWideband(const float* mic, float* out, int n) {
+    float dp = 0.0f, ep = 0.0f, op = 0.0f;
+    const int specBins = static_cast<int>(dhat_hist_.size());
+    const bool wbAllowed = sec_path_.isCalibrated();
 
     for (int i = 0; i < n; i++) {
-        float e_n = mic[i]; // 误差信号 = 麦克风输入 (残差)
+        const float e = mic[i];
 
-        // 1. 估计次级路径对前一帧输出的贡献: Ŝ * y(n-1)
-        //    使用独立的输出次级路径滤波缓冲
-        float s_hat_y = filterOutputSecondaryPath(prev_output_);
+        const float sy = sec_path_.filter(line_out_, prev_out_);
+        float dhat = std::clamp(e - sy, -2.0f, 2.0f);
 
-        // 2. 估计原始噪声: d̂(n) = e(n) - Ŝ·y(n-1)
-        float d_hat = e_n - s_hat_y;
+        float y = 0.0f;
+        if (wbAllowed) {
+            const float d_bp = bp_ref_.process(dhat);
+            const float e_bp = bp_err_.process(e);
 
-        // 3. 限幅噪声估计 (防止异常值导致发散)
-        d_hat = std::clamp(d_hat, -1.0f, 1.0f);
+            y = wide_filter_.process(d_bp);
+            const float xh = sec_path_.filter(line_ref_, d_bp);
+            wide_filter_.pushFilteredRef(xh);
+            xh_pow_ = 0.9995f * xh_pow_ + 0.0005f * (xh * xh);
 
-        // 4. 反馈自适应滤波器输出
-        float y_n = feedback_filter_->process(d_hat);
+            const float mu = std::min(1.0f, config_.stepSize / (xh_pow_ + 1e-9f));
+            wide_filter_.update(e_bp, mu);
+        }
 
-        // 5. 反噪声
-        float anti_noise = -y_n * config_.outputGain;
-        anti_noise = std::clamp(anti_noise, -0.95f, 0.95f);
-        out[i] = anti_noise;
+        if (y > 0.95f) y = 0.95f; else if (y < -0.95f) y = -0.95f;
+        out[i] = y;
+        prev_out_ = y;
 
-        // 保存当前输出供下一帧使用
-        prev_output_ = anti_noise;
+        err_block_[i] = e;
+        dhat_block_[i] = dhat;
+        dhat_hist_[hist_pos_] = dhat;
+        err_hist_[hist_pos_] = e;
+        if (++hist_pos_ >= specBins) hist_pos_ = 0;
 
-        // 6. 标量滤波参考: x̂(n) = Ŝ * d̂(n)
-        float x_hat_n = sec_path_->filterSample(d_hat);
-
-        // 7. FxLMS 权重更新 (标量 x̂(n) · 完整向量更新)
-        feedback_filter_->update(x_hat_n, e_n);
-
-        // 统计与频谱
-        ref_buffer_[i] = d_hat;
-        err_buffer_[i] = e_n;
-        ref_power += d_hat * d_hat;
-        err_power += e_n * e_n;
+        dp += dhat * dhat;
+        ep += e * e;
+        op += y * y;
+        out_pow_slow_ = 0.9995f * out_pow_slow_ + 0.0005f * (y * y);
     }
 
-    updateStats(ref_power / n, err_power / n);
-
-    if (stats_.frameCount % 8 == 0) {
-        ref_analyzer_->analyze(ref_buffer_.data(), n);
-        err_analyzer_->analyze(err_buffer_.data(), n);
-    }
+    pushHistory(mic, n);
+    updateStats(dp / n, ep / n, op / n);
 }
 
 // ============================================================
-// Hybrid ANC (混合模式 — 推荐)
+// 混合模式: 窄带谐波 + 低频宽带
 // ============================================================
 void AudioProcessor::processHybrid(const float* mic, float* out, int n) {
-    /**
-     * Hybrid ANC — 标量 FxLMS 正确实现 (前馈 + 反馈)
-     *
-     * 结构:
-     *   x(n) ──→ [W_ff] ──→ y_ff(n) ──┐
-     *                                    ├──→ y(n) = y_ff + y_fb ──→ 扬声器
-     *   d̂(n) ──→ [W_fb] ──→ y_fb(n) ──┘
-     *
-     * 前馈分支: 处理宽带成分 (利用参考信号预测)
-     *   x(n) = mic(n)
-     *   e(n) = x(n) + anti_noise
-     *   x̂_ff(n) = Ŝ * x(n)
-     *   W_ff ← leaky·W_ff + μ_ff·x̂_ff(n)·e(n)·x_buf
-     *
-     * 反馈分支: 处理窄带残余 (弥补前馈不足)
-     *   d̂(n) = e(n) - Ŝ·y_ff(n)  (只减去前馈贡献，避免循环依赖)
-     *   x̂_fb(n) = Ŝ * d̂(n)
-     *   W_fb ← leaky·W_fb + μ_fb·x̂_fb(n)·e(n)·d̂_buf
-     *
-     * 解耦设计:
-     *   反馈分支的参考估计 d̂(n) 只使用 Ŝ·y_ff(n)
-     *   而非 Ŝ·y(n) = Ŝ·(y_ff + y_fb)，避免 y_fb 依赖自身的循环
-     */
-
-    float ref_power = 0.0f;
-    float err_power = 0.0f;
+    float dp = 0.0f, ep = 0.0f, op = 0.0f;
+    const int specBins = static_cast<int>(dhat_hist_.size());
+    const bool wbAllowed = sec_path_.isCalibrated();
 
     for (int i = 0; i < n; i++) {
-        float x_n = mic[i];  // 参考信号
+        const float e = mic[i];
 
-        // ── 前馈分支 ──
-        float y_ff = forward_filter_->process(x_n);
+        // --- 1. 扰动估计 d̂ = e - Ŝ*y(n-1) ---
+        const float sy = sec_path_.filter(line_out_, prev_out_);
+        float dhat = std::clamp(e - sy, -2.0f, 2.0f);
 
-        // ── 反馈分支: 估计窄带残余噪声 ──
-        // 使用前馈输出通过次级路径的估计
-        float s_hat_y_ff = filterOutputSecondaryPath(-y_ff * config_.outputGain);
-        float e_n_approx = x_n + (-y_ff * config_.outputGain);  // 前馈残差
-        e_n_approx = std::clamp(e_n_approx, -1.0f, 1.0f);
+        // --- 2. 低频宽带分支 ---
+        float y_wb = 0.0f;
+        if (wbAllowed) {
+            const float d_bp = bp_ref_.process(dhat);
+            const float e_bp = bp_err_.process(e);
 
-        // 原始噪声估计 (只减去前馈贡献)
-        float d_hat = e_n_approx - s_hat_y_ff;
-        d_hat = std::clamp(d_hat, -1.0f, 1.0f);
+            y_wb = wide_filter_.process(d_bp);
+            const float xh = sec_path_.filter(line_ref_, d_bp);
+            wide_filter_.pushFilteredRef(xh);
+            xh_pow_ = 0.9995f * xh_pow_ + 0.0005f * (xh * xh);
 
-        // 反馈滤波器输出
-        float y_fb = feedback_filter_->process(d_hat);
+            // 同 processWideband: 按 Σx̂² 归一化 (参考功率 × 滤波器长度)
+            const float mu = std::min(0.1f, config_.stepSize /
+                                      (static_cast<float>(wide_filter_.length()) * xh_pow_ + 1e-9f));
+            wide_filter_.update(e_bp, mu);
+        }
 
-        // ── 混合输出 ──
-        float y_n = y_ff + y_fb;
-        float anti_noise = -y_n * config_.outputGain;
-        anti_noise = std::clamp(anti_noise, -0.95f, 0.95f);
-        out[i] = anti_noise;
+        // --- 3. 窄带谐波分支 (直接用实测误差做相关) ---
+        const float y_h = harmonic_.process(e);
 
-        // ── 误差估计 (用于两路权重更新) ──
-        float e_n = x_n + anti_noise;
+        // --- 4. 合成输出 ---
+        float y = y_h + y_wb;
+        if (y > 0.95f) y = 0.95f; else if (y < -0.95f) y = -0.95f;
+        out[i] = y;
+        prev_out_ = y;
 
-        // ── 前馈 FxLMS 更新 ──
-        float x_hat_ff = sec_path_->filterSample(x_n);
-        forward_filter_->update(x_hat_ff, e_n);
+        err_block_[i] = e;
+        dhat_block_[i] = dhat;
+        dhat_hist_[hist_pos_] = dhat;
+        err_hist_[hist_pos_] = e;
+        if (++hist_pos_ >= specBins) hist_pos_ = 0;
 
-        // ── 反馈 FxLMS 更新 ──
-        // 使用独立缓冲计算 x̂_fb = Ŝ·d̂(n)，避免与前馈的 filterSample 共享 path_buffer_
-        float x_hat_fb = sec_path_->filterSampleWithBuffer(d_hat, sec_fb_buf_, sec_fb_buf_idx_);
-        feedback_filter_->update(x_hat_fb, e_n);
-
-        // 统计与频谱
-        ref_buffer_[i] = x_n;
-        err_buffer_[i] = e_n;
-        ref_power += x_n * x_n;
-        err_power += e_n * e_n;
+        dp += dhat * dhat;
+        ep += e * e;
+        op += y * y;
+        out_pow_slow_ = 0.9995f * out_pow_slow_ + 0.0005f * (y * y);
     }
 
-    updateStats(ref_power / n, err_power / n);
+    pushHistory(mic, n);
+    updateStats(dp / n, ep / n, op / n);
+}
 
-    if (stats_.frameCount % 8 == 0) {
-        ref_analyzer_->analyze(ref_buffer_.data(), n);
-        err_analyzer_->analyze(err_buffer_.data(), n);
+// ============================================================
+// 基频检测与稳定性保护
+// ============================================================
+void AudioProcessor::runToneDetection() {
+    const float f0 = tone_detector_.detect();
+    const float prevF0 = harmonic_.f0();
+
+    if (f0 > 0.0f) {
+        const bool needLock = (harmonic_.harmonicCount() == 0) ||
+                              (prevF0 <= 0.0f) ||
+                              (std::fabs(f0 - prevF0) / prevF0 > 0.10f);
+        if (needLock) {
+            harmonic_.lockTo(f0);
+        }
+    } else if (harmonic_.harmonicCount() > 0) {
+        // 连续 3 次检不到窄带成分就释放
+        static thread_local int miss = 0;
+        if (++miss >= 3) { harmonic_.lockTo(0.0f); miss = 0; }
+        return;
+    }
+
+    // ---- 运行时失稳 / 过度驱动保护 ----
+    guard_counter_++;
+    const float outRms = std::sqrt(std::max(out_pow_slow_, 0.0f));
+    const float nr = stats_.noiseReductionDb;
+    if (outRms > 0.40f || nr < -3.0f) {
+        guard_counter_ = 0;
+        config_.tonalStep = std::max(5e-5f, config_.tonalStep * 0.5f);
+        harmonic_.setStep(config_.tonalStep);
+        harmonic_.reset();
+        wide_filter_.reset();
+        wide_filter_.setLeaky(0.999f);
+        stats_.isConverged = false;
+    } else if (guard_counter_ >= 12 && nr > 8.0f && outRms < 0.20f) {
+        guard_counter_ = 0;
+        // 缓慢回到与回环延迟匹配的标称步长 (与 updateTonalStep 同一规则)
+        const float D = std::max(48.0f, static_cast<float>(std::max(1, sec_path_.delaySamples())));
+        const float nominal = std::clamp(1.0f / D, 2e-4f, 2e-3f);
+        if (config_.tonalStep < nominal) {
+            config_.tonalStep = std::min(nominal, config_.tonalStep * 1.5f);
+            harmonic_.setStep(config_.tonalStep);
+        }
     }
 }
 
 // ============================================================
-// 统计与辅助
+// 统计
 // ============================================================
-
-void AudioProcessor::updateStats(float ref_power, float err_power) {
-    // 指数移动平均 (EMA)
-    const float alpha = 0.005f;
-    ref_power_accum_ = (1.0f - alpha) * ref_power_accum_ + alpha * ref_power;
-    err_power_accum_ = (1.0f - alpha) * err_power_accum_ + alpha * err_power;
+void AudioProcessor::updateStats(float dhatPower, float errPower, float outPower) {
+    const float alpha = 0.01f;
+    d_pow_ = (1.0f - alpha) * d_pow_ + alpha * dhatPower;
+    e_pow_ = (1.0f - alpha) * e_pow_ + alpha * errPower;
+    o_pow_ = (1.0f - alpha) * o_pow_ + alpha * outPower;
 
     stats_counter_++;
-    if (stats_counter_ >= 10) {
-        stats_.referencePower = ref_power_accum_;
-        stats_.errorPower = err_power_accum_;
-
-        // 降噪量 (dB): 正值 = 降噪
-        if (ref_power_accum_ > 1e-10f && err_power_accum_ > 1e-10f) {
-            float ratio = ref_power_accum_ / err_power_accum_;
-            stats_.noiseReductionDb = 10.0f * log10f(ratio);
+    if (stats_counter_ >= 8) {
+        stats_counter_ = 0;
+        stats_.referencePower = d_pow_;
+        stats_.errorPower = e_pow_;
+        stats_.outputPower = o_pow_;
+        if (d_pow_ > 1e-12f && e_pow_ > 1e-12f) {
+            stats_.noiseReductionDb = 10.0f * std::log10(d_pow_ / e_pow_);
         } else {
             stats_.noiseReductionDb = 0.0f;
         }
-
-        stats_.filterNorm = forward_filter_->getWeightNorm();
+        stats_.filterNorm = wide_filter_.weightNorm();
+        stats_.loopDelayMs = sec_path_.delayMs();
+        stats_.tonalHz = harmonic_.f0();
+        stats_.tonalCount = harmonic_.harmonicCount();
+        stats_.isCalibrated = sec_path_.isCalibrated();
         stats_.isConverged = stats_.noiseReductionDb > 3.0f;
-        stats_counter_ = 0;
     }
 }
 
-void AudioProcessor::generateAuxiliaryNoise(float* buffer, int len) {
-    float level = 0.01f; // -40dB
-    for (int i = 0; i < len; i++) {
-        buffer[i] = level * (2.0f * (rand() & 0x7FFF) / 32767.0f - 1.0f);
-    }
-}
-
-ANCStats AudioProcessor::getStats() const {
-    return stats_;
-}
-
-void AudioProcessor::getRefSpectrum(float* output, int len) {
-    if (ref_analyzer_) ref_analyzer_->getMagnitudeSpectrum(output, len);
-}
-
-void AudioProcessor::getErrSpectrum(float* output, int len) {
-    if (err_analyzer_) err_analyzer_->getMagnitudeSpectrum(output, len);
-}
-
-void AudioProcessor::getReductionSpectrum(float* output, int len) {
-    if (ref_analyzer_ && err_analyzer_) {
-        ref_analyzer_->getReductionSpectrum(
-            ref_buffer_.data(), err_buffer_.data(),
-            std::min((int)ref_buffer_.size(), (int)err_buffer_.size()),
-            output, len);
-    }
-}
+ANCStats AudioProcessor::getStats() const { return stats_; }
 
 void AudioProcessor::setStepSize(float mu) {
-    config_.stepSize = mu;
-    if (forward_filter_) forward_filter_->setStepSize(mu);
-    if (feedback_filter_) feedback_filter_->setStepSize(mu * 0.5f);
+    config_.stepSize = std::clamp(mu, 1e-5f, 1.0f);
+    wide_filter_.setStep(config_.stepSize);
 }
 
 void AudioProcessor::setOutputGain(float gain) {
-    config_.outputGain = gain;
+    config_.outputGain = std::clamp(gain, 0.1f, 4.0f);
 }
 
 void AudioProcessor::setMode(int mode) {
-    config_.mode = std::clamp(mode, 0, 2);
+    const int m = std::clamp(mode, 0, 2);
+    if (m != config_.mode) {
+        config_.mode = m;
+        harmonic_.reset();
+        wide_filter_.reset();
+        bp_ref_.reset();
+        bp_err_.reset();
+        out_pow_slow_ = 0.0f;
+    }
 }
 
 void AudioProcessor::setExternalSpeaker(bool external) {
@@ -447,57 +438,92 @@ void AudioProcessor::setExternalSpeaker(bool external) {
     config_.outputGain = external ? 2.0f : 1.0f;
 }
 
-void AudioProcessor::startCalibration() {
-    calibrating_.store(true);
-    sec_path_->reset();
+void AudioProcessor::setMaxHarmonics(int n) {
+    config_.maxHarmonics = std::clamp(n, 1, 8);
+    harmonic_.init(static_cast<float>(config_.sampleRate), config_.maxHarmonics,
+                   config_.controlLowHz, config_.controlHighHz, config_.tonalStep);
+    harmonic_.setSecondaryPath(&sec_path_);
 }
 
 void AudioProcessor::reset() {
-    if (forward_filter_) forward_filter_->reset();
-    if (feedback_filter_) feedback_filter_->reset();
-    if (sec_path_) sec_path_->reset();
-
-    std::fill(ref_buffer_.begin(), ref_buffer_.end(), 0.0f);
-    std::fill(err_buffer_.begin(), err_buffer_.end(), 0.0f);
-    std::fill(output_buffer_.begin(), output_buffer_.end(), 0.0f);
-    std::fill(sec_output_buf_.begin(), sec_output_buf_.end(), 0.0f);
-    std::fill(sec_fb_buf_.begin(), sec_fb_buf_.end(), 0.0f);
-
+    wide_filter_.reset();
+    harmonic_.reset();
+    std::fill(dhat_hist_.begin(), dhat_hist_.end(), 0.0f);
+    std::fill(err_hist_.begin(), err_hist_.end(), 0.0f);
+    std::fill(out_block_.begin(), out_block_.end(), 0.0f);
+    line_out_.reset();
+    line_ref_.reset();
+    bp_ref_.reset();
+    bp_err_.reset();
+    tone_detector_.reset();
     stats_ = ANCStats{};
-    ref_power_accum_ = 0.0f;
-    err_power_accum_ = 0.0f;
+    stats_.loopDelayMs = sec_path_.delayMs();
+    stats_.isCalibrated = sec_path_.isCalibrated();
+    d_pow_ = e_pow_ = o_pow_ = 0.0f;
+    xh_pow_ = 1e-6f;
+    out_pow_slow_ = 0.0f;
     stats_counter_ = 0;
-    sec_output_idx_ = 0;
-    sec_fb_buf_idx_ = 0;
-    prev_output_ = 0.0f;
+    hist_pos_ = 0;
+    prev_out_ = 0.0f;
+    guard_counter_ = 0;
+    detect_elapsed_ms_ = 0;
+    // 步长回到与回环延迟匹配的保守初值
+    updateTonalStep();
 }
 
-void AudioProcessor::offlineCalibrate(const float* input, const float* output, int len) {
-    // 使用互相关法估计次级路径脉冲响应
-    // h[n] = Rxy[n] / Rxx[0]
-    // 其中 Rxy 是输入-输出互相关, Rxx 是输入自相关
-    int pathLen = config_.secondaryPathLength;
-    if (len < pathLen || !sec_path_) return;
+// ============================================================
+// 频谱 (非实时, 由 JNI 线程调用)
+// ============================================================
+void AudioProcessor::refreshAnalysis() {
+    if (!spec_) return;
+    const int specBins = static_cast<int>(dhat_hist_.size());
+    std::vector<float> linear(static_cast<size_t>(specBins), 0.0f);
 
-    std::vector<float> h(pathLen, 0.0f);
-
-    // 计算自相关 Rxx[0]
-    float rxx0 = 0.0f;
-    for (int i = 0; i < len; i++) {
-        rxx0 += input[i] * input[i];
+    // 环形缓冲线性化
+    for (int i = 0; i < specBins; i++) {
+        linear[i] = dhat_hist_[(hist_pos_ + i) % specBins];
     }
-    if (rxx0 < 1e-12f) return;
-
-    // 计算互相关 Rxy[0..pathLen-1]
-    for (int lag = 0; lag < pathLen; lag++) {
-        float rxy = 0.0f;
-        for (int i = lag; i < len; i++) {
-            rxy += input[i - lag] * output[i];
-        }
-        h[lag] = rxy / rxx0;
+    spec_->analyze(linear.data(), specBins);
+    const int half = specBins / 2;
+    std::vector<float> tmp(static_cast<size_t>(half), 0.0f);
+    spec_->getMagnitudeSpectrum(tmp.data(), half);
+    {
+        std::lock_guard<std::mutex> lk(spectrum_mutex_);
+        ref_spectrum_ = tmp;
     }
 
-    sec_path_->setPathCoeffs(h.data(), pathLen);
+    for (int i = 0; i < specBins; i++) {
+        linear[i] = err_hist_[(hist_pos_ + i) % specBins];
+    }
+    spec_->analyze(linear.data(), specBins);
+    spec_->getMagnitudeSpectrum(tmp.data(), half);
+    {
+        std::lock_guard<std::mutex> lk(spectrum_mutex_);
+        err_spectrum_ = tmp;
+    }
+}
+
+void AudioProcessor::getRefSpectrum(float* output, int len) {
+    refreshAnalysis();
+    std::lock_guard<std::mutex> lk(spectrum_mutex_);
+    const int copyLen = std::min(len, static_cast<int>(ref_spectrum_.size()));
+    std::memcpy(output, ref_spectrum_.data(), copyLen * sizeof(float));
+}
+
+void AudioProcessor::getErrSpectrum(float* output, int len) {
+    refreshAnalysis();
+    std::lock_guard<std::mutex> lk(spectrum_mutex_);
+    const int copyLen = std::min(len, static_cast<int>(err_spectrum_.size()));
+    std::memcpy(output, err_spectrum_.data(), copyLen * sizeof(float));
+}
+
+void AudioProcessor::getReductionSpectrum(float* output, int len) {
+    refreshAnalysis();
+    std::lock_guard<std::mutex> lk(spectrum_mutex_);
+    const int copyLen = std::min(len, static_cast<int>(ref_spectrum_.size()));
+    for (int i = 0; i < copyLen; i++) {
+        output[i] = ref_spectrum_[i] - err_spectrum_[i];
+    }
 }
 
 } // namespace anc

@@ -9,7 +9,8 @@
  * 实现Radix-2 FFT (避免引入额外库依赖)
  */
 
-#include "anc_engine.h"
+#include "spectrum_analyzer.h"
+#include <algorithm>
 #include <cmath>
 
 namespace anc {
@@ -19,7 +20,7 @@ namespace anc {
 #define M_PI 3.14159265358979323846
 #endif
 
-static void fft(float* real, float* imag, int n) {
+void SpectrumAnalyzer::fft(float* real, float* imag, int n) {
     // Bit-reversal permutation
     for (int i = 1, j = 0; i < n; i++) {
         int bit = n >> 1;
@@ -105,6 +106,13 @@ void SpectrumAnalyzer::getMagnitudeSpectrum(float* output, int outputLen) {
     for (int i = 0; i < copyLen; i++) {
         // 转换为dB
         output[i] = 20.0f * log10f(magnitude_[i] + 1e-10f);
+    }
+}
+
+void SpectrumAnalyzer::getLinearMagnitude(float* output, int outputLen) {
+    int copyLen = std::min(outputLen, fft_size_ / 2);
+    for (int i = 0; i < copyLen; i++) {
+        output[i] = magnitude_[i];
     }
 }
 

@@ -1,428 +1,505 @@
 /**
- * QuietZone ANC 单元测试
+ * QuietZone ANC 单元测试 (v4)
  *
- * 在桌面端验证 C++ 实现与 Python 仿真结果一致:
- *   1. FxLMSFilter 标量更新正确性
- *   2. SecondaryPathEstimator 逐样本滤波
- *   3. AudioProcessor 三种 ANC 模式收敛性
+ * v4 相比 v3 的测试改动:
+ *   v3 的主收敛用例只断言 frameCount > 0，注释还写"只要 NR>0 就说明在工作"，
+ *   而且该用例的参数让 Ŝ 全零 —— 权重一次都不会更新，测试照样 PASS。
+ *   "9/9 通过"没有任何信息量。
  *
- * 编译: cd tests && mkdir build && cd build
- *       cmake .. && make
- * 运行: ./anc_unit_test
+ *   v4 的做法: 在测试里搭一个虚拟次级路径，跑真正的闭环，
+ *   断言端到端降噪量、输出非静音、以及未校准时不发散。
+ *
+ * 编译 (桌面端):
+ *   g++ -std=c++17 -O2 -I app/src/main/cpp \
+ *       tests/anc_unit_test.cpp \
+ *       app/src/main/cpp/anc_core.cpp \
+ *       app/src/main/cpp/audio_processor.cpp \
+ *       app/src/main/cpp/spectrum_analyzer.cpp -o anc_unit_test
  */
 
 #include "anc_engine.h"
-#include <cstdio>
+#include "spectrum_analyzer.h"
+
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <vector>
-#include <chrono>
-#include <algorithm>
-
-// ============================================================
-// 测试辅助
-// ============================================================
-static int g_pass = 0;
-static int g_fail = 0;
-
-#define ASSERT_TRUE(cond, msg) do { \
-    if (!(cond)) { printf("  ❌ FAIL: %s\n", msg); g_fail++; return false; } \
-} while(0)
-
-#define ASSERT_NEAR(a, b, tol, msg) do { \
-    float _a = (a), _b = (b), _tol = (tol); \
-    if (std::fabs(_a - _b) > _tol) { \
-        printf("  ❌ FAIL: %s (got %.4f, expected %.4f, tol %.4f)\n", msg, _a, _b, _tol); \
-        g_fail++; return false; } \
-} while(0)
-
-#define ASSERT_GT(a, b, msg) do { \
-    if (!((a) > (b))) { printf("  ❌ FAIL: %s (%.4f > %.4f)\n", msg, (float)(a), (float)(b)); g_fail++; return false; } \
-} while(0)
-
-#define ASSERT_EQ(a, b, msg) do { \
-    if ((a) != (b)) { printf("  ❌ FAIL: %s (%d != %d)\n", msg, (int)(a), (int)(b)); g_fail++; return false; } \
-} while(0)
-
-#define RUN_TEST(fn) do { \
-    printf("▶ %s\n", #fn); \
-    if (fn()) { printf("  ✅ PASS\n"); g_pass++; } \
-} while(0)
-
-// 简易正弦波生成
-static void generateSine(float* out, int n, float freq, float sr, float amp) {
-    for (int i = 0; i < n; i++) {
-        out[i] = amp * sinf(2.0f * M_PI * freq * i / sr);
-    }
-}
-
-// 简易 FIR 卷积 (生成 d(n) = P * x(n))
-static void convolve(const float* x, int xlen, const float* h, int hlen, float* out) {
-    for (int n = 0; n < xlen; n++) {
-        float sum = 0.0f;
-        for (int k = 0; k < hlen && k <= n; k++) {
-            sum += h[k] * x[n - k];
-        }
-        out[n] = sum;
-    }
-}
-
-// 计算尾部 NR (dB)
-static float computeNR(const float* d, const float* e, int n, int tail) {
-    float pd = 0.0f, pe = 0.0f;
-    for (int i = n - tail; i < n; i++) {
-        pd += d[i] * d[i];
-        pe += e[i] * e[i];
-    }
-    pd /= tail;
-    pe /= tail;
-    if (pd < 1e-20f || pe < 1e-20f) return 0.0f;
-    return 10.0f * log10f(pd / pe);
-}
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
+using namespace anc;
+
+static int g_pass = 0;
+static int g_fail = 0;
+
+#define ASSERT_TRUE(cond, msg) do { \
+    if (!(cond)) { printf("  [FAIL] %s\n", msg); g_fail++; return false; } \
+} while (0)
+
+#define ASSERT_NEAR(a, b, tol, msg) do { \
+    float _a = (a), _b = (b), _tol = (tol); \
+    if (std::fabs(_a - _b) > _tol) { \
+        printf("  [FAIL] %s (got %.6f, expected %.6f, tol %.6f)\n", msg, _a, _b, _tol); \
+        g_fail++; return false; } \
+} while (0)
+
+#define ASSERT_GT(a, b, msg) do { \
+    if (!((a) > (b))) { printf("  [FAIL] %s (%.4f > %.4f)\n", msg, (float)(a), (float)(b)); g_fail++; return false; } \
+} while (0)
+
+#define RUN_TEST(fn) do { \
+    printf(">> %s\n", #fn); \
+    if (fn()) { printf("   PASS\n"); g_pass++; } \
+} while (0)
+
 // ============================================================
-// 测试 1: FxLMSFilter 基本操作
+// 虚拟次级路径 (与音频回调里一致的"延迟余项"块卷积)
+//
+// 说明: 本类的 pending/feed 拆分依赖一个前提 ——
+//   次级路径的纯延迟 D >= 块长 B。
+// 此时本块第 i 个输出的来自"块内更早输出"的耦合项 h[k]*y(i-k) (k<=i<n<=B<=D)
+// 因 h[0..D-1]=0 而恒为零，于是本块输出只由更早各块的 y 决定，
+// pending() 就能在任何控制器运行之前精确算出。
+// 测试里 D>=288、B<=256，满足该前提。
 // ============================================================
-bool test_fxlms_basic() {
-    anc::FxLMSFilter filter(32, 0.01f, 0.9999f);
+class VirtualPlant {
+public:
+    VirtualPlant(const std::vector<float>& h, int block)
+        : h_(h), M_(static_cast<int>(h.size())), B_(block) {}
 
-    // 初始权重应为 0
-    ASSERT_NEAR(filter.getWeightNorm(), 0.0f, 1e-6f, "Initial weight norm should be 0");
-
-    // 处理一个样本
-    float y = filter.process(1.0f);
-    ASSERT_NEAR(y, 0.0f, 1e-6f, "Output should be 0 (all weights are 0)");
-
-    // 更新权重: w += mu * x_hat * e * x_buf
-    filter.update(1.0f, 1.0f);
-    float norm = filter.getWeightNorm();
-    ASSERT_GT(norm, 0.0f, "Weight norm should be > 0 after update");
-
-    // 重置
-    filter.reset();
-    ASSERT_NEAR(filter.getWeightNorm(), 0.0f, 1e-6f, "Weight norm should be 0 after reset");
-
-    return true;
-}
-
-// ============================================================
-// 测试 2: FxLMSFilter 标量更新收敛性
-// ============================================================
-bool test_fxlms_convergence() {
-    const int L = 64;
-    const int N = 8000;
-    const float sr = 8000.0f;
-    const float freq = 200.0f;
-    const float mu = 0.01f;
-
-    anc::FxLMSFilter filter(L, mu, 0.9999f);
-
-    // 简单场景: d(n) = x(n), S₂ = Ŝ = [0.5] (简化)
-    // y(n) = W·x_buf, anti = -y(n)
-    // e(n) = d(n) + anti = x(n) - y(n)
-    // x̂(n) = Ŝ·x(n) = 0.5*x(n)
-    // w += μ * 0.5*x(n) * e(n) * x_buf
-
-    std::vector<float> x(N), e(N);
-    generateSine(x.data(), N, freq, sr, 0.5f);
-
-    for (int n = 0; n < N; n++) {
-        float x_n = x[n];
-        float y_n = filter.process(x_n);
-        float anti = -y_n;
-        float e_n = x_n + anti;  // 简化误差
-        float x_hat_n = 0.5f * x_n;  // 标量滤波参考
-        filter.update(x_hat_n, e_n);
-        e[n] = e_n;
+    /** 取本块对象输出 (只依赖更早各块的 y) */
+    void pending(float* out, int n) {
+        const long n0 = static_cast<long>(yhist_.size());
+        for (int i = 0; i < n; i++) {
+            double acc = 0.0;
+            for (int k = i + 1; k < M_; k++) {          // k > i ⇒ y(n0+i-k) 属于历史
+                const long idx = n0 + i - k;
+                if (idx >= 0) acc += static_cast<double>(h_[static_cast<size_t>(k)]) *
+                                     yhist_[static_cast<size_t>(idx)];
+            }
+            out[i] = static_cast<float>(acc);
+        }
     }
 
-    // 尾部 NR (简化场景 NR 偏低, 降低阈值)
-    float nr = computeNR(x.data(), e.data(), N, N / 4);
-    printf("    Simple convergence NR: %.1f dB\n", nr);
-    ASSERT_GT(nr, 3.0f, "NR should be > 3 dB after convergence");
-
-    return true;
-}
-
-// ============================================================
-// 测试 3: SecondaryPathEstimator filterSample
-// ============================================================
-bool test_sec_path_filter_sample() {
-    anc::SecondaryPathEstimator est(4, 128);
-
-    // 设置简单系数: Ŝ = [0, 0, 1, 0] (2 样本延迟)
-    float coeffs[] = {0.0f, 0.0f, 1.0f, 0.0f};
-    est.setPathCoeffs(coeffs, 4);
-
-    // 输入脉冲 [1, 0, 0, 0, 0, 0]
-    float r0 = est.filterSample(1.0f);  // Ŝ·[1,0,0,0] = 0
-    float r1 = est.filterSample(0.0f);  // Ŝ·[0,1,0,0] = 0
-    float r2 = est.filterSample(0.0f);  // Ŝ·[0,0,1,0] = 1
-    float r3 = est.filterSample(0.0f);  // Ŝ·[0,0,0,1] = 0
-
-    ASSERT_NEAR(r0, 0.0f, 1e-6f, "Sample 0 should be 0");
-    ASSERT_NEAR(r1, 0.0f, 1e-6f, "Sample 1 should be 0");
-    ASSERT_NEAR(r2, 1.0f, 1e-6f, "Sample 2 should be 1 (delay=2)");
-    ASSERT_NEAR(r3, 0.0f, 1e-6f, "Sample 3 should be 0");
-
-    return true;
-}
-
-// ============================================================
-// 测试 4: SecondaryPathEstimator filterSampleWithBuffer 独立性
-// ============================================================
-bool test_sec_path_independent_buffers() {
-    anc::SecondaryPathEstimator est(4, 128);
-
-    float coeffs[] = {0.0f, 0.0f, 1.0f, 0.0f};
-    est.setPathCoeffs(coeffs, 4);
-
-    // 独立缓冲 A
-    std::vector<float> buf_a(4, 0.0f);
-    int idx_a = 0;
-
-    // 独立缓冲 B
-    std::vector<float> buf_b(4, 0.0f);
-    int idx_b = 0;
-
-    // 交替使用两个缓冲
-    float ra0 = est.filterSampleWithBuffer(1.0f, buf_a, idx_a);  // A: [1,0,0,0] → 0
-    float rb0 = est.filterSampleWithBuffer(2.0f, buf_b, idx_b);  // B: [2,0,0,0] → 0
-    float ra1 = est.filterSampleWithBuffer(0.0f, buf_a, idx_a);  // A: [0,1,0,0] → 0
-    float rb1 = est.filterSampleWithBuffer(0.0f, buf_b, idx_b);  // B: [0,2,0,0] → 0
-    float ra2 = est.filterSampleWithBuffer(0.0f, buf_a, idx_a);  // A: [0,0,1,0] → 1
-    float rb2 = est.filterSampleWithBuffer(0.0f, buf_b, idx_b);  // B: [0,0,2,0] → 2
-
-    ASSERT_NEAR(ra0, 0.0f, 1e-6f, "A sample 0 should be 0");
-    ASSERT_NEAR(rb0, 0.0f, 1e-6f, "B sample 0 should be 0");
-    ASSERT_NEAR(ra2, 1.0f, 1e-6f, "A sample 2 should be 1");
-    ASSERT_NEAR(rb2, 2.0f, 1e-6f, "B sample 2 should be 2 (independent)");
-
-    return true;
-}
-
-// ============================================================
-// 测试 5: Feedforward ANC 收敛 (对照 Python 44 dB)
-// ============================================================
-bool test_feedforward_anc() {
-    using namespace anc;
-
-    const int fs_i = 8000;
-    const int N = 80000;  // 10s
-    const float sr = 8000.0f;
-
-    ANCConfig config;
-    config.sampleRate = fs_i;
-    config.filterLength = 128;
-    config.secondaryPathLength = 4;
-    config.stepSize = 0.005f;
-    config.leakyFactor = 0.9999f;
-    config.blockSize = 128;
-    config.mode = 0;       // Feedforward
-
-    AudioProcessor proc;
-    proc.init(config);
-    proc.enable(true);
-
-    // 生成信号
-    std::vector<float> x(N), out(N);
-    generateSine(x.data(), N, 200.0f, sr, 0.8f);
-
-    // 分块处理 (每 128 样本一块)
-    int block = 128;
-    for (int b = 0; b < N / block; b++) {
-        proc.processFrame(&x[b * block], &out[b * block], block);
+    /** 把本块产生的 y 记入历史 */
+    void feed(const float* y, int n) {
+        for (int i = 0; i < n; i++) yhist_.push_back(y[i]);
     }
 
-    // 获取统计
-    ANCStats stats = proc.getStats();
-    printf("    FF NR: %.1f dB, Converged: %s, Frames: %d, Norm: %.4f\n",
-           stats.noiseReductionDb, stats.isConverged ? "yes" : "no",
-           stats.frameCount, stats.filterNorm);
+    int length() const { return M_; }
 
-    // 关键验证: 处理不崩溃、帧数正确
-    ASSERT_GT(stats.frameCount, 0, "Should have processed frames");
+private:
+    std::vector<float> h_;
+    std::vector<float> yhist_;
+    int M_;
+    int B_;
+};
 
-    // 注意: 在单麦克风简化模式下 (mic=x, e=x+anti),
-    // 当 anti ≈ -x 时 e ≈ 0，可能导致权重范数很小
-    // 这是单麦克风固有限制，不是 bug
-    // 只要 NR > 0 就说明算法在工作
+// 构造一个"手机式"次级路径: 纯延迟 D + 二阶低通滚降
+static std::vector<float> makeSecondaryPath(int D, int tailLen = 256, float fc = 400.0f,
+                                            float fs = 48000.0f) {
+    std::vector<float> h(static_cast<size_t>(D + tailLen), 0.0f);
+    // 二阶低通的冲激响应 (双实极点近似)
+    const float a = std::exp(-2.0f * static_cast<float>(M_PI) * fc / fs);
+    float v = 1.0f;
+    float sum = 0.0f;
+    std::vector<float> tail(static_cast<size_t>(tailLen), 0.0f);
+    for (int i = 0; i < tailLen; i++) {
+        tail[static_cast<size_t>(i)] = v;
+        v *= a;
+        sum += tail[static_cast<size_t>(i)];
+    }
+    for (int i = 0; i < tailLen; i++) {
+        h[static_cast<size_t>(D + i)] = tail[static_cast<size_t>(i)] / (sum > 1e-9f ? sum : 1.0f);
+    }
+    return h;
+}
 
+static void addTone(float* buf, int n, float f, float amp, float fs) {
+    for (int i = 0; i < n; i++) {
+        buf[i] += amp * std::sin(2.0f * static_cast<float>(M_PI) * f * i / fs);
+    }
+}
+
+static float rms(const float* x, int n) {
+    double s = 0.0;
+    for (int i = 0; i < n; i++) s += static_cast<double>(x[i]) * x[i];
+    return static_cast<float>(std::sqrt(s / n));
+}
+
+// ============================================================
+// 测试 1: SecondaryPath 的延迟检测与滤波
+// ============================================================
+static bool test_secondary_path_filtering() {
+    const int D = 64;
+    auto h = makeSecondaryPath(D);
+    SecondaryPath sp;
+    sp.setImpulseResponse(h.data(), static_cast<int>(h.size()), 48000.0f);
+
+    ASSERT_TRUE(sp.isCalibrated(), "should be calibrated after setImpulseResponse");
+    ASSERT_NEAR(static_cast<float>(sp.delaySamples()), static_cast<float>(D), 8.0f,
+                "detected delay should be close to D");
+
+    // 用同一模型滤波: y 应为 x 经 h 的结果 (与直接卷积对比)
+    SecPathLine line;
+    line.resize(sp.ringSize());
+    const int N = 400;
+    std::vector<float> x(static_cast<size_t>(N), 0.0f);
+    for (int i = 0; i < N; i++) x[static_cast<size_t>(i)] = std::sin(0.05f * i);
+
+    std::vector<float> got(static_cast<size_t>(N), 0.0f);
+    for (int i = 0; i < N; i++) got[static_cast<size_t>(i)] = sp.filter(line, x[static_cast<size_t>(i)]);
+
+    float maxErr = 0.0f;
+    for (int n = D + 8; n < N; n++) {
+        double ref = 0.0;
+        for (int k = 0; k < static_cast<int>(h.size()); k++) {
+            if (n - k >= 0) ref += h[static_cast<size_t>(k)] * x[static_cast<size_t>(n - k)];
+        }
+        maxErr = std::max(maxErr, std::fabs(static_cast<float>(ref) - got[static_cast<size_t>(n)]));
+    }
+    printf("     max |Ŝ*x - h*x| = %.3e\n", maxErr);
+    ASSERT_TRUE(maxErr < 1e-4f, "sparse FIR must equal direct convolution");
+
+    // 复频响与直接 DFT 对比
+    float mag = 0.0f, ph = 0.0f;
+    sp.responseAt(300.0f, mag, ph);
+    double re = 0.0, im = 0.0;
+    for (size_t k = 0; k < h.size(); k++) {
+        re += h[k] * std::cos(2.0 * M_PI * 300.0 * k / 48000.0);
+        im -= h[k] * std::sin(2.0 * M_PI * 300.0 * k / 48000.0);
+    }
+    const float refMag = static_cast<float>(std::sqrt(re * re + im * im));
+    printf("     |S(300Hz)| sparse=%.6f direct=%.6f\n", mag, refMag);
+    ASSERT_NEAR(mag, refMag, 1e-3f, "responseAt must match direct DFT");
     return true;
 }
 
 // ============================================================
-// 测试 6: AudioProcessor 三种模式不崩溃
+// 测试 2: 自适应滤波器能辨识已知 FIR
 // ============================================================
-bool test_all_modes_no_crash() {
-    using namespace anc;
+static bool test_adaptive_filter_system_id() {
+    const int L = 32;
+    AdaptiveFilter af;
+    af.init(L, 0.02f, 1.0f);          // 无泄漏
 
-    const int N = 4096;
+    // 目标系统: 3 抽头
+    const float target[3] = {0.5f, -0.3f, 0.2f};
+
+    std::vector<float> xhist;
+    uint32_t seed = 12345;
+    auto rnd = [&seed]() {
+        seed = seed * 1103515245u + 12345u;
+        return (static_cast<float>((seed >> 8) & 0xFFFF) / 32768.0f) - 1.0f;
+    };
+
+    SecPathLine dummy;   // 这里直接用 x 作为滤波参考 (S = 1)
+    for (int n = 0; n < 40000; n++) {
+        const float x = rnd();
+        xhist.push_back(x);
+        const float y = af.process(x);
+        af.pushFilteredRef(x);       // Ŝ = 1
+        float d = 0.0f;
+        for (int k = 0; k < 3; k++) {
+            if (n - k >= 0) d += target[k] * xhist[static_cast<size_t>(n - k)];
+        }
+        const float e = d - y * 0.0f;   // 这里只做辨识: 误差 = 目标输出 - 滤波器输出
+        (void)e;
+        // 系统辨识: 误差 = target*x - w*x
+        af.update(d - y, 0.02f / 0.35f);
+    }
+
+    const float* w = af.weights();
+    printf("     w[0..2] = %.3f %.3f %.3f (expect 0.5 -0.3 0.2)\n", w[0], w[1], w[2]);
+    ASSERT_NEAR(w[0], 0.5f, 0.08f, "w[0] should converge to 0.5");
+    ASSERT_NEAR(w[1], -0.3f, 0.08f, "w[1] should converge to -0.3");
+    ASSERT_NEAR(w[2], 0.2f, 0.08f, "w[2] should converge to 0.2");
+    return true;
+}
+
+// ============================================================
+// 测试 3: 谐波抵消器在真实延迟环路下收敛 (核心)
+// ============================================================
+static bool test_harmonic_canceller_closed_loop() {
+    const float fs = 48000.0f;
+    const int D = 288;                 // 6 ms 回环延迟
     const int block = 128;
+    auto h = makeSecondaryPath(D);
 
-    std::vector<float> mic(N, 0.0f);
-    std::vector<float> out(N, 0.0f);
+    SecondaryPath sp;
+    sp.setImpulseResponse(h.data(), static_cast<int>(h.size()), fs);
 
-    // 填充随机输入
+    HarmonicCanceller hc;
+    hc.init(fs, 6, 30.0f, 600.0f, 0.002f);
+    hc.setSecondaryPath(&sp);
+    const int nh = hc.lockTo(120.0f);
+    ASSERT_TRUE(nh >= 3, "should lock at least 3 harmonics of 120Hz");
+    printf("     locked harmonics: %d\n", nh);
+
+    VirtualPlant plant(h, block);
+    SecPathLine line;
+    line.resize(sp.ringSize());
+    (void)line;
+
+    const int N = 3 * 48000;           // 3 秒
+    std::vector<float> d(static_cast<size_t>(N), 0.0f);
+    addTone(d.data(), N, 120.0f, 0.05f, fs);
+    addTone(d.data(), N, 240.0f, 0.025f, fs);
+    addTone(d.data(), N, 360.0f, 0.012f, fs);
+
+    std::vector<float> e(static_cast<size_t>(N), 0.0f);
+    std::vector<float> y(static_cast<size_t>(N), 0.0f);
+    std::vector<float> pend(static_cast<size_t>(block), 0.0f);
+
+    for (int n0 = 0; n0 < N; n0 += block) {
+        const int n = std::min(block, N - n0);
+        plant.pending(pend.data(), n);
+        for (int i = 0; i < n; i++) {
+            e[static_cast<size_t>(n0 + i)] = d[static_cast<size_t>(n0 + i)] + pend[static_cast<size_t>(i)];
+        }
+        for (int i = 0; i < n; i++) {
+            y[static_cast<size_t>(n0 + i)] = hc.process(e[static_cast<size_t>(n0 + i)]);
+        }
+        plant.feed(&y[static_cast<size_t>(n0)], n);
+    }
+
+    const int tail = 48000;
+    const float dRms = rms(&d[static_cast<size_t>(N - tail)], tail);
+    const float eRms = rms(&e[static_cast<size_t>(N - tail)], tail);
+    const float yRms = rms(&y[static_cast<size_t>(N - tail)], tail);
+    const float nr = 20.0f * std::log10(std::max(dRms, 1e-9f) / std::max(eRms, 1e-9f));
+    printf("     d_rms=%.5f e_rms=%.6f y_rms=%.5f  NR=%.1f dB\n", dRms, eRms, yRms, nr);
+
+    ASSERT_GT(yRms, 1e-4f, "anti-noise output must NOT be silent (v3 bug)");
+    ASSERT_GT(nr, 20.0f, "closed-loop narrowband NR should exceed 20 dB");
+    return true;
+}
+
+// ============================================================
+// 测试 4: 回环延迟变大仍然稳定 (只允许更小的步长)
+// ============================================================
+static bool test_harmonic_canceller_long_delay() {
+    const float fs = 48000.0f;
+    const int D = 960;                 // 20 ms
+    const int block = 256;
+    auto h = makeSecondaryPath(D);
+
+    SecondaryPath sp;
+    sp.setImpulseResponse(h.data(), static_cast<int>(h.size()), fs);
+
+    // 长延迟下步长必须显著减小 (仿真: D=960 时临界 ~0.0025, 取 0.002)
+    const float step = 0.002f;
+
+    HarmonicCanceller hc;
+    hc.init(fs, 6, 30.0f, 600.0f, step);
+    hc.setSecondaryPath(&sp);
+    hc.lockTo(150.0f);
+
+    VirtualPlant plant(h, block);
+    const int N = 6 * 48000;           // 6 秒 (长延迟收敛慢)
+    std::vector<float> d(static_cast<size_t>(N), 0.0f);
+    addTone(d.data(), N, 150.0f, 0.05f, fs);
+    addTone(d.data(), N, 300.0f, 0.025f, fs);
+
+    std::vector<float> e(static_cast<size_t>(N), 0.0f);
+    std::vector<float> y(static_cast<size_t>(N), 0.0f);
+    std::vector<float> pend(static_cast<size_t>(block), 0.0f);
+
+    for (int n0 = 0; n0 < N; n0 += block) {
+        const int n = std::min(block, N - n0);
+        plant.pending(pend.data(), n);
+        for (int i = 0; i < n; i++) {
+            e[static_cast<size_t>(n0 + i)] = d[static_cast<size_t>(n0 + i)] + pend[static_cast<size_t>(i)];
+        }
+        for (int i = 0; i < n; i++) {
+            y[static_cast<size_t>(n0 + i)] = hc.process(e[static_cast<size_t>(n0 + i)]);
+        }
+        plant.feed(&y[static_cast<size_t>(n0)], n);
+    }
+
+    const int tail = 48000;
+    const float dRms = rms(&d[static_cast<size_t>(N - tail)], tail);
+    const float eRms = rms(&e[static_cast<size_t>(N - tail)], tail);
+    const float nr = 20.0f * std::log10(std::max(dRms, 1e-9f) / std::max(eRms, 1e-9f));
+    printf("     D=%d (20ms) step=%.5f  NR=%.1f dB  e_rms=%.6f\n", D, step, nr, eRms);
+
+    ASSERT_TRUE(eRms < dRms, "residual must not exceed the disturbance (no divergence)");
+    ASSERT_GT(nr, 8.0f, "long-delay narrowband NR should still exceed 8 dB");
+    return true;
+}
+
+// ============================================================
+// 测试 5: 基频检测器
+// ============================================================
+static bool test_tone_detector() {
+    const float fs = 48000.0f;
+    ToneDetector td;
+    td.init(fs, 4096, 30.0f, 900.0f, 6.0f);
+
+    const int N = 8000;
+    std::vector<float> x(static_cast<size_t>(N), 0.0f);
+    addTone(x.data(), N, 137.0f, 0.1f, fs);
+    addTone(x.data(), N, 274.0f, 0.05f, fs);
+    // 加一点宽带
+    uint32_t s = 7;
     for (int i = 0; i < N; i++) {
-        mic[i] = 0.3f * (2.0f * (float)rand() / RAND_MAX - 1.0f);
+        s = s * 1103515245u + 12345u;
+        x[static_cast<size_t>(i)] += 0.005f * ((static_cast<float>((s >> 8) & 0xFFFF) / 32768.0f) - 1.0f);
     }
-
-    for (int mode = 0; mode <= 2; mode++) {
-        ANCConfig config;
-        config.filterLength = 64;
-        config.secondaryPathLength = 32;
-        config.stepSize = 0.005f;
-        config.blockSize = block;
-        config.mode = mode;
-
-        AudioProcessor proc;
-        proc.init(config);
-        proc.enable(true);
-
-        // 处理多个块
-        for (int b = 0; b < N / block; b++) {
-            proc.processFrame(&mic[b * block], &out[b * block], block);
-        }
-
-        ANCStats stats = proc.getStats();
-        const char* mode_names[] = {"Feedforward", "Feedback", "Hybrid"};
-        printf("    %s: NR=%.1f dB, Norm=%.2f, Frames=%d\n",
-               mode_names[mode], stats.noiseReductionDb, stats.filterNorm, stats.frameCount);
-
-        // 验证没有 NaN/Inf
-        bool has_nan = false;
-        for (int i = 0; i < N; i++) {
-            if (std::isnan(out[i]) || std::isinf(out[i])) {
-                has_nan = true;
-                break;
-            }
-        }
-        ASSERT_TRUE(!has_nan, "Output should not contain NaN/Inf");
-
-        // 验证输出被限幅
-        bool output_clipped = false;
-        for (int i = 0; i < N; i++) {
-            if (std::fabs(out[i]) > 1.0f) {
-                output_clipped = true;
-                break;
-            }
-        }
-        ASSERT_TRUE(!output_clipped, "Output should be within [-1, 1]");
-    }
-
+    td.push(x.data(), N);
+    const float f0 = td.detect();
+    printf("     detected f0 = %.2f Hz (true 137 / sub-harmonic 45.7)\n", f0);
+    ASSERT_TRUE(f0 > 0.0f, "should detect a narrowband component");
+    // 允许检测到基频或其低次谐波
+    const bool ok = std::fabs(f0 - 137.0f) < 6.0f ||
+                    std::fabs(f0 - 68.5f) < 4.0f ||
+                    std::fabs(f0 - 45.67f) < 3.0f;
+    ASSERT_TRUE(ok, "detected frequency should match the tone or its sub-harmonic");
     return true;
 }
 
 // ============================================================
-// 测试 7: FxLMS 权重限幅防发散
+// 测试 6: 纯宽带噪声下不应发散
 // ============================================================
-bool test_fxlms_weight_clamp() {
-    anc::FxLMSFilter filter(32, 0.1f, 0.9999f);  // 大步长
+static bool test_processor_white_noise_stability() {
+    const float fs = 48000.0f;
+    const int block = 128;
+    auto h = makeSecondaryPath(288);
 
-    // 持续用大信号更新
-    for (int i = 0; i < 10000; i++) {
-        filter.process(10.0f);
-        filter.update(10.0f, 10.0f);  // 极大梯度
-    }
-
-    // 权重应被限幅在 [-10, 10]
-    const float* w = filter.getWeights();
-    bool all_clamped = true;
-    for (int i = 0; i < filter.getLength(); i++) {
-        if (std::fabs(w[i]) > 10.5f) {  // 留 0.5 余量
-            all_clamped = false;
-            break;
-        }
-    }
-    ASSERT_TRUE(all_clamped, "Weights should be clamped to [-10, 10]");
-
-    printf("    Max weight: %.2f\n", filter.getWeightNorm());
-    return true;
-}
-
-// ============================================================
-// 测试 8: SecondaryPathEstimator setPathCoeffs
-// ============================================================
-bool test_sec_path_set_coeffs() {
-    anc::SecondaryPathEstimator est(8, 128);
-
-    float coeffs[] = {0.0f, 0.5f, 0.3f, 0.1f};
-    est.setPathCoeffs(coeffs, 4);
-
-    const float* stored = est.getPathCoeffs();
-    ASSERT_NEAR(stored[0], 0.0f, 1e-6f, "Coeff 0 should be 0");
-    ASSERT_NEAR(stored[1], 0.5f, 1e-6f, "Coeff 1 should be 0.5");
-    ASSERT_NEAR(stored[2], 0.3f, 1e-6f, "Coeff 2 should be 0.3");
-    ASSERT_NEAR(stored[3], 0.1f, 1e-6f, "Coeff 3 should be 0.1");
-    // 其余应为 0
-    for (int i = 4; i < 8; i++) {
-        ASSERT_NEAR(stored[i], 0.0f, 1e-6f, "Coeffs beyond set length should be 0");
-    }
-
-    return true;
-}
-
-// ============================================================
-// 测试 9: AudioProcessor reset 清理状态
-// ============================================================
-bool test_processor_reset() {
-    using namespace anc;
-
-    ANCConfig config;
-    config.filterLength = 64;
-    config.secondaryPathLength = 32;
-    config.blockSize = 128;
+    ANCConfig cfg;
+    cfg.sampleRate = static_cast<int>(fs);
+    cfg.filterLength = 256;
+    cfg.secondaryPathLength = 1024;
+    cfg.blockSize = block;
+    cfg.mode = 0;
 
     AudioProcessor proc;
-    proc.init(config);
+    proc.init(cfg);
+    proc.setSecondaryPathIr(h.data(), static_cast<int>(h.size()));
     proc.enable(true);
 
-    // 处理一些数据
-    std::vector<float> mic(128, 0.5f), out(128, 0.0f);
-    for (int i = 0; i < 100; i++) {
-        proc.processFrame(mic.data(), out.data(), 128);
+    VirtualPlant plant(h, block);
+    const int N = 2 * 48000;
+    std::vector<float> d(static_cast<size_t>(N), 0.0f);
+    uint32_t s = 99;
+    for (int i = 0; i < N; i++) {
+        s = s * 1103515245u + 12345u;
+        d[static_cast<size_t>(i)] = 0.05f * ((static_cast<float>((s >> 8) & 0xFFFF) / 32768.0f) - 1.0f);
+    }
+    std::vector<float> e(static_cast<size_t>(N), 0.0f);
+    std::vector<float> y(static_cast<size_t>(N), 0.0f);
+    std::vector<float> pend(static_cast<size_t>(block), 0.0f);
+    std::vector<float> out(static_cast<size_t>(block), 0.0f);
+
+    for (int n0 = 0; n0 < N; n0 += block) {
+        const int n = std::min(block, N - n0);
+        plant.pending(pend.data(), n);
+        for (int i = 0; i < n; i++) {
+            e[static_cast<size_t>(n0 + i)] = d[static_cast<size_t>(n0 + i)] + pend[static_cast<size_t>(i)];
+        }
+        proc.processFrame(&e[static_cast<size_t>(n0)], out.data(), n);
+        for (int i = 0; i < n; i++) y[static_cast<size_t>(n0 + i)] = out[static_cast<size_t>(i)];
+        plant.feed(&y[static_cast<size_t>(n0)], n);
     }
 
-    // 重置
-    proc.reset();
+    const int tail = 24000;
+    const float dRms = rms(&d[static_cast<size_t>(N - tail)], tail);
+    const float eRms = rms(&e[static_cast<size_t>(N - tail)], tail);
+    const float yRms = rms(&y[static_cast<size_t>(N - tail)], tail);
+    printf("     white: d_rms=%.5f e_rms=%.5f y_rms=%.5f\n", dRms, eRms, yRms);
 
-    ANCStats stats = proc.getStats();
-    ASSERT_NEAR(stats.noiseReductionDb, 0.0f, 1e-6f, "NR should be 0 after reset");
-    ASSERT_NEAR(stats.referencePower, 0.0f, 1e-6f, "Ref power should be 0 after reset");
-    ASSERT_EQ(stats.frameCount, 0, "Frame count should be 0 after reset");
-
+    ASSERT_TRUE(eRms < 4.0f * dRms, "must not blow up on broadband noise");
+    ASSERT_TRUE(eRms > 0.2f * dRms, "must not destroy the signal either");
     return true;
 }
 
 // ============================================================
-// Main
+// 测试 7: 未启用时输出必须为零 (不泄漏麦克风信号到扬声器)
+// ============================================================
+static bool test_disabled_output_silent() {
+    ANCConfig cfg;
+    cfg.blockSize = 128;
+    AudioProcessor proc;
+    proc.init(cfg);
+    proc.enable(false);
+
+    std::vector<float> mic(128, 0.5f);
+    std::vector<float> out(128, 9.9f);
+    proc.processFrame(mic.data(), out.data(), 128);
+    for (int i = 0; i < 128; i++) {
+        ASSERT_NEAR(out[static_cast<size_t>(i)], 0.0f, 1e-9f, "disabled output must be silent");
+    }
+    return true;
+}
+
+// ============================================================
+// 测试 8: 输出限幅
+// ============================================================
+static bool test_output_limiting() {
+    const float fs = 48000.0f;
+    auto h = makeSecondaryPath(288);
+    ANCConfig cfg;
+    cfg.sampleRate = static_cast<int>(fs);
+    cfg.blockSize = 128;
+    cfg.mode = 0;
+    AudioProcessor proc;
+    proc.init(cfg);
+    proc.setSecondaryPathIr(h.data(), static_cast<int>(h.size()));
+    proc.enable(true);
+
+    std::vector<float> mic(128, 0.0f);
+    std::vector<float> out(128, 0.0f);
+    addTone(mic.data(), 128, 120.0f, 4.0f, fs);   // 极端大信号
+    for (int b = 0; b < 200; b++) {
+        proc.processFrame(mic.data(), out.data(), 128);
+        for (int i = 0; i < 128; i++) {
+            if (std::fabs(out[static_cast<size_t>(i)]) > 1.0f) {
+                ASSERT_TRUE(false, "output must stay within [-1, 1]");
+            }
+        }
+    }
+    return true;
+}
+
+// ============================================================
+// 测试 9: 频谱分析器基本正确性
+// ============================================================
+static bool test_spectrum_analyzer() {
+    SpectrumAnalyzer sa(1024);
+    std::vector<float> x(1024, 0.0f);
+    addTone(x.data(), 1024, 48000.0f * 100.0f / 1024.0f, 1.0f, 48000.0f);
+    sa.analyze(x.data(), 1024);
+    std::vector<float> mag(512, 0.0f);
+    sa.getLinearMagnitude(mag.data(), 512);
+    int best = 0;
+    for (int i = 1; i < 512; i++) if (mag[static_cast<size_t>(i)] > mag[static_cast<size_t>(best)]) best = i;
+    printf("     peak bin = %d (expect 100)\n", best);
+    ASSERT_TRUE(std::abs(best - 100) <= 1, "FFT peak should be at bin 100");
+    return true;
+}
+
 // ============================================================
 int main() {
-    printf("╔══════════════════════════════════════════════════╗\n");
-    printf("║  QuietZone ANC Unit Tests (Desktop)             ║\n");
-    printf("╚══════════════════════════════════════════════════╝\n\n");
+    printf("==================================================\n");
+    printf("  QuietZone ANC Unit Tests v4 (desktop)\n");
+    printf("==================================================\n\n");
 
-    srand(42);
+    RUN_TEST(test_secondary_path_filtering);
+    RUN_TEST(test_adaptive_filter_system_id);
+    RUN_TEST(test_harmonic_canceller_closed_loop);
+    RUN_TEST(test_harmonic_canceller_long_delay);
+    RUN_TEST(test_tone_detector);
+    RUN_TEST(test_processor_white_noise_stability);
+    RUN_TEST(test_disabled_output_silent);
+    RUN_TEST(test_output_limiting);
+    RUN_TEST(test_spectrum_analyzer);
 
-    RUN_TEST(test_fxlms_basic);
-    RUN_TEST(test_fxlms_convergence);
-    RUN_TEST(test_sec_path_filter_sample);
-    RUN_TEST(test_sec_path_independent_buffers);
-    RUN_TEST(test_feedforward_anc);
-    RUN_TEST(test_all_modes_no_crash);
-    RUN_TEST(test_fxlms_weight_clamp);
-    RUN_TEST(test_sec_path_set_coeffs);
-    RUN_TEST(test_processor_reset);
-
-    printf("\n══════════════════════════════════════════════════\n");
-    printf("  Results: %d passed, %d failed, %d total\n",
-           g_pass, g_fail, g_pass + g_fail);
-    printf("══════════════════════════════════════════════════\n");
-
+    printf("\n--------------------------------------------------\n");
+    printf("  Results: %d passed, %d failed, %d total\n", g_pass, g_fail, g_pass + g_fail);
+    printf("--------------------------------------------------\n");
     return g_fail > 0 ? 1 : 0;
 }

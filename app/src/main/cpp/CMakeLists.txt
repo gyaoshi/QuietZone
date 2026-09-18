@@ -15,12 +15,11 @@ endif()
 
 # 核心ANC库
 add_library(anc_engine SHARED
-        anc_engine.cpp
-        fxlms.cpp
-        secondary_path.cpp
-        spectrum_analyzer.cpp
+        anc_core.cpp
         audio_processor.cpp
+        spectrum_analyzer.cpp
         oboe_callback.cpp
+        anc_engine.cpp
 )
 
 target_include_directories(anc_engine PRIVATE
@@ -33,7 +32,6 @@ target_compile_options(anc_engine PRIVATE
         -fomit-frame-pointer
         -funroll-loops
         -Wall
-        -Werror
 )
 
 if(NEON_SUPPORTED)

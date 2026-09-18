@@ -10,6 +10,7 @@
     <!-- 前台服务（保持ANC后台运行） -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- 外接USB音频设备 -->
@@ -36,10 +37,10 @@
             </intent-filter>
         </activity>
 
-        <!-- ANC前台服务 -->
+        <!-- ANC前台服务 (需要同时采集麦克风并播放反噪声) -->
         <service
             android:name=".engine.ANCService"
-            android:foregroundServiceType="mediaPlayback"
+            android:foregroundServiceType="mediaPlayback|microphone"
             android:exported="false" />
 
     </application>

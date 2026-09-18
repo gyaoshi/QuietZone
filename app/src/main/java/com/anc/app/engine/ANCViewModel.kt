@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -12,6 +13,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * ANC 状态机 ViewModel
@@ -39,9 +41,10 @@ sealed class ANCState {
 data class ANCUIState(
     val state: ANCState = ANCState.Idle,
     val selectedMode: Int = ANCEngine.MODE_HYBRID,
-    val stepSize: Float = 0.01f,
+    val stepSize: Float = 0.08f,
     val outputGain: Float = 1.0f,
     val externalSpeaker: Boolean = false,
+    val maxHarmonics: Int = 6,
     val stats: ANCStats = ANCStats(),
     val refSpectrum: FloatArray = FloatArray(128) { -100f },
     val errSpectrum: FloatArray = FloatArray(128) { -100f }
@@ -54,6 +57,7 @@ data class ANCUIState(
                 stepSize == other.stepSize &&
                 outputGain == other.outputGain &&
                 externalSpeaker == other.externalSpeaker &&
+                maxHarmonics == other.maxHarmonics &&
                 stats == other.stats &&
                 refSpectrum.contentEquals(other.refSpectrum) &&
                 errSpectrum.contentEquals(other.errSpectrum)
@@ -65,6 +69,7 @@ data class ANCUIState(
         result = 31 * result + stepSize.hashCode()
         result = 31 * result + outputGain.hashCode()
         result = 31 * result + externalSpeaker.hashCode()
+        result = 31 * result + maxHarmonics
         result = 31 * result + stats.hashCode()
         result = 31 * result + refSpectrum.contentHashCode()
         result = 31 * result + errSpectrum.contentHashCode()
@@ -129,9 +134,18 @@ class ANCViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun recalibrate() {
-        engine.calibrate()
+        if (_uiState.value.state is ANCState.Idle ||
+            _uiState.value.state is ANCState.Error) {
+            return
+        }
         _uiState.value = _uiState.value.copy(state = ANCState.Calibrating)
-        startCalibrationMonitor()
+        // nativeCalibrate() 阻塞约 0.7s, 必须放在 IO 线程
+        viewModelScope.launch {
+            val ok = withContext(Dispatchers.IO) { engine.calibrate() }
+            _uiState.value = _uiState.value.copy(
+                state = if (ok) ANCState.Converging(0f) else ANCState.Running(0f, 0f, false)
+            )
+        }
     }
 
     // ===== 内部实现 =====
@@ -151,6 +165,7 @@ class ANCViewModel(application: Application) : AndroidViewModel(application) {
 
         engine.setOutputGain(_uiState.value.outputGain)
         engine.setExternalSpeaker(_uiState.value.externalSpeaker)
+        engine.setMaxHarmonics(_uiState.value.maxHarmonics)
 
         // 启动 ANC 前台服务
         val context = getApplication<Application>()
@@ -174,8 +189,8 @@ class ANCViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         _uiState.value = _uiState.value.copy(state = ANCState.Calibrating)
-        startCalibrationMonitor()
         startStatsPolling()
+        runCalibration()
     }
 
     private fun stopANC() {
@@ -193,15 +208,17 @@ class ANCViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.value = _uiState.value.copy(state = ANCState.Idle)
     }
 
-    private fun startCalibrationMonitor() {
+    /**
+     * 次级路径校准 (播放扫频探测信号 + 匹配滤波)。
+     * nativeCalibrate() 是阻塞的 (约 0.7 秒)，必须放在 IO 线程。
+     * 校准失败不致命: 窄带谐波分支仍可用，只是宽带分支不启用。
+     */
+    private fun runCalibration() {
         viewModelScope.launch {
-            while (isActive) {
-                if (!engine.isCalibrating()) {
-                    _uiState.value = _uiState.value.copy(state = ANCState.Converging(0f))
-                    break
-                }
-                delay(100)
-            }
+            val ok = withContext(Dispatchers.IO) { engine.calibrate() }
+            _uiState.value = _uiState.value.copy(
+                state = if (ok) ANCState.Converging(0f) else ANCState.Running(0f, 0f, false)
+            )
         }
     }
 
@@ -215,17 +232,17 @@ class ANCViewModel(application: Application) : AndroidViewModel(application) {
                     val errSpec = engine.getSpectrum(ANCEngine.SPECTRUM_ERROR)
 
                     val currentState = _uiState.value.state
+                    // 校准结束、引擎在跑就是 Running; isConverged 仅作为徽标展示。
+                    // (宽带噪声下 NR 可能很低, 用 isConverged 当状态机会永远停在"收敛中")
                     val newState: ANCState = when {
-                        stats.isConverged -> ANCState.Running(
+                        currentState is ANCState.Calibrating -> currentState
+                        currentState is ANCState.Error -> currentState
+                        engine.isRunning() -> ANCState.Running(
                             noiseReductionDb = stats.noiseReductionDb,
                             processingTimeUs = stats.processingTimeUs,
-                            isConverged = true
+                            isConverged = stats.isConverged
                         )
-                        currentState is ANCState.Converging || currentState is ANCState.Calibrating -> {
-                            val progress = (stats.noiseReductionDb / 10f).coerceIn(0f, 1f)
-                            ANCState.Converging(progress)
-                        }
-                        else -> currentState
+                        else -> ANCState.Idle
                     }
 
                     _uiState.value = _uiState.value.copy(

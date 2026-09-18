@@ -77,8 +77,19 @@ class ANCService : Service() {
             while (isRunning && engine.isRunning()) {
                 val stats = engine.getStats()
                 if (stats != null) {
-                    val msg = String.format("降噪 %.1f dB | 延迟 %.0f μs",
-                        stats.noiseReductionDb, stats.processingTimeUs)
+                    val msg = if (stats.tonalCount > 0) {
+                        String.format(
+                            "降噪 %.1f dB | 基频 %.0f Hz ×%d | 回环 %.1f ms",
+                            stats.noiseReductionDb, stats.tonalHz,
+                            stats.tonalCount, stats.loopDelayMs
+                        )
+                    } else {
+                        String.format(
+                            "降噪 %.1f dB | 回环 %.1f ms%s",
+                            stats.noiseReductionDb, stats.loopDelayMs,
+                            if (stats.isCalibrated) "" else " | 未校准"
+                        )
+                    }
                     updateNotification(msg)
                 }
                 try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
@@ -100,8 +111,10 @@ class ANCService : Service() {
         if (intent.hasExtra(EXTRA_EXTERNAL_SPEAKER)) {
             val external = intent.getBooleanExtra(EXTRA_EXTERNAL_SPEAKER, false)
             engine.setExternalSpeaker(external)
+            // 外接音箱会改变次级路径增益, 需重新校准。
+            // nativeCalibrate() 阻塞约 0.7s, 不能占用主线程。
             if (external) {
-                engine.calibrate()
+                Thread({ engine.calibrate() }, "ANC-ExternalCalib").start()
             }
         }
     }
