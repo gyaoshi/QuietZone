@@ -63,15 +63,15 @@ jobs:
     - name: Upload Debug APK
       uses: actions/upload-artifact@v4
       with:
+        retention-days: 3
         name: debug-apk
         path: app/build/outputs/apk/debug/app-debug.apk
-
     - name: Upload Release APK
       uses: actions/upload-artifact@v4
       with:
+        retention-days: 3
         name: release-apk
         path: app/build/outputs/apk/release/app-release-unsigned.apk
-
     - name: Publish to fixed 'latest' release
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       env:
